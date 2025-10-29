@@ -1,0 +1,15 @@
+[project]
+name = "wanda"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.10.1",
+    "datasets>=4.1.1",
+    "numpy>=2.3.3",
+    "protobuf>=6.32.1",
+    "sentencepiece>=0.2.1",
+    "torch>=2.8.0",
+    "transformers==4.45.2",
+]
