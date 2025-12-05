@@ -304,6 +304,7 @@ def main():
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     parser.add_argument("--use_cpu", action="store_true", help="Force CPU usage even if GPU is available")
+    parser.add_argument("--skip_eval", action="store_true", help="Skip perplexity evaluation (useful for CPU mode or when memory is constrained)")
     args = parser.parse_args()
 
     # Setting seeds for reproducibility
@@ -378,28 +379,55 @@ def main():
     print("*"*30)
     ################################################################
     
-    # Clear GPU cache before evaluation to free up memory
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        print(f"GPU memory before eval: {torch.cuda.memory_allocated()/1024**3:.2f} GB / {torch.cuda.get_device_properties(0).total_memory/1024**3:.2f} GB")
+    # Save model BEFORE evaluation to ensure it's saved even if evaluation fails/kills process
+    # This is especially important for CPU mode where evaluation can run out of RAM
+    if args.save_model:
+        print(f"\n{'='*60}")
+        print("Saving pruned model before evaluation...")
+        print(f"{'='*60}\n")
+        model.save_pretrained(args.save_model)
+        tokenizer.save_pretrained(args.save_model)
+        print(f"✅ Model saved to {args.save_model}")
+        print("   (Saved before evaluation to ensure it's preserved even if evaluation fails)\n")
     
-    # Try evaluation, but skip if OOM occurs
-    try:
-        ppl_test = eval_ppl(args, model, tokenizer, device)
-        print(f"wikitext perplexity {ppl_test}")
-    except Exception as e:
-        if "OutOfMemoryError" in str(type(e).__name__) or "out of memory" in str(e).lower():
-            print(f"\n{'='*60}")
-            print("Evaluation skipped due to GPU memory constraints.")
-            print("Model has been pruned successfully and will be saved.")
-            print("You can evaluate the model separately with:")
-            print("  - More GPU memory available")
-            print("  - Using CPU-only evaluation (--use_cpu flag)")
-            print("  - Or loading the saved model in a separate session")
-            print(f"{'='*60}\n")
-            ppl_test = None
-        else:
-            raise
+    # Skip evaluation if requested or if using CPU mode (evaluation is very memory-intensive on CPU)
+    ppl_test = None
+    if args.skip_eval:
+        print("Skipping evaluation (--skip_eval flag set)")
+        ppl_test = None
+    elif args.use_cpu:
+        print(f"\n{'='*60}")
+        print("⚠️  WARNING: Evaluation on CPU is very memory-intensive and may cause OOM.")
+        print("   Pruning completed successfully. Model has been saved.")
+        print("   To evaluate the model:")
+        print("   1. Load the saved model separately with more RAM available")
+        print("   2. Or use GPU for evaluation: python use_pruned_model.py --model_path <path>")
+        print("   3. Or add --skip_eval flag to skip evaluation entirely")
+        print(f"{'='*60}\n")
+        ppl_test = None
+    else:
+        # Clear GPU cache before evaluation to free up memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"GPU memory before eval: {torch.cuda.memory_allocated()/1024**3:.2f} GB / {torch.cuda.get_device_properties(0).total_memory/1024**3:.2f} GB")
+        
+        # Try evaluation, but skip if OOM occurs
+        try:
+            ppl_test = eval_ppl(args, model, tokenizer, device)
+            print(f"wikitext perplexity {ppl_test}")
+        except Exception as e:
+            if "OutOfMemoryError" in str(type(e).__name__) or "out of memory" in str(e).lower():
+                print(f"\n{'='*60}")
+                print("Evaluation skipped due to GPU memory constraints.")
+                print("Model has been pruned successfully and has been saved.")
+                print("You can evaluate the model separately with:")
+                print("  - More GPU memory available")
+                print("  - Using CPU-only evaluation (--use_cpu flag)")
+                print("  - Or loading the saved model in a separate session")
+                print(f"{'='*60}\n")
+                ppl_test = None
+            else:
+                raise
 
     if not os.path.exists(args.save):
         os.makedirs(args.save)
@@ -423,9 +451,12 @@ def main():
         print("zero_shot evaluation results")
         print(results)
 
+    # Model already saved before evaluation (see above)
+    # Only save again if save_model path changed or if we want to update it
     if args.save_model:
-        model.save_pretrained(args.save_model)
-        tokenizer.save_pretrained(args.save_model)
+        # Check if model was already saved (to avoid duplicate saves)
+        # The model was saved before evaluation, so we're done
+        pass
 
 if __name__ == '__main__':
     main()
