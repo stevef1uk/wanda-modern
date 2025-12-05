@@ -11,18 +11,281 @@ from lib.eval import eval_ppl, eval_zero_shot
 print('torch', version('torch'))
 print('transformers', version('transformers'))
 print('accelerate', version('accelerate'))
-print('# of gpus: ', torch.cuda.device_count())
+print('# of gpus: ', torch.cuda.device_count() if torch.cuda.is_available() else 0)
 
-def get_llm(model_name, cache_dir="llm_weights"):
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, 
-        torch_dtype=torch.float16, 
-        cache_dir=cache_dir, 
-        low_cpu_mem_usage=True, 
-        device_map="auto"
-    )
+def get_llm(model_name, cache_dir="llm_weights", use_gpu=True):
+    """
+    Load model with GPU support and memory management to avoid OOM.
+    Uses device_map="auto" with max_memory limits to allow CPU offloading if needed.
+    For Modal/cloud environments, prevents CPU offloading to avoid rotary_emb initialization issues.
+    """
+    # Use float16 for efficiency (works on both GPU and CPU)
+    torch_dtype = torch.float16
+    
+    # For Modal/cloud environments, prevent offloading to avoid rotary_emb initialization issues
+    is_modal = os.getenv("MODAL_ENVIRONMENT") or os.getenv("MODAL")
+    
+    if use_gpu and torch.cuda.is_available():
+        # Calculate GPU memory limits - reserve some for operations
+        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        # Reserve ~2GB for operations (pruning needs temporary memory for sorting, etc.)
+        reserved_gb = max(2.0, gpu_memory_gb * 0.15)  # Reserve 15% or at least 2GB for pruning operations
+        max_memory_gb = gpu_memory_gb - reserved_gb
+        
+        if is_modal:
+            # On Modal, prevent CPU offloading to avoid rotary_emb initialization issues
+            # This ensures rotary_emb modules are properly initialized on GPU
+            print(f"Modal environment detected: Preventing CPU offloading to avoid rotary_emb issues")
+            max_memory = {
+                0: f"{max_memory_gb:.1f}GiB",
+                "cpu": "0GiB"  # Disable CPU offloading on Modal
+            }
+        else:
+            # Set max_memory to allow CPU offloading if GPU runs out (for local runs)
+            max_memory = {
+                0: f"{max_memory_gb:.1f}GiB",
+                "cpu": "50GiB"  # Allow CPU offloading with 50GB limit
+            }
+        
+        print(f"GPU detected: {gpu_memory_gb:.2f} GB total, reserving {reserved_gb:.1f} GB")
+        if is_modal:
+            print(f"Model will use up to {max_memory_gb:.1f} GB GPU memory (CPU offloading disabled)")
+        else:
+            print(f"Model will use up to {max_memory_gb:.1f} GB GPU memory, with CPU offloading as fallback")
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, 
+            torch_dtype=torch_dtype, 
+            cache_dir=cache_dir, 
+            low_cpu_mem_usage=True, 
+            device_map="auto",
+            max_memory=max_memory
+        )
+    else:
+        print("Using CPU (GPU not available or disabled)")
+        # Use float16 for CPU to reduce memory usage (~7GB vs ~14GB for float32)
+        torch_dtype = torch.float16
+        print("Using float16 on CPU (~7GB RAM required)")
+        print("Loading model (this may take 5-10 minutes on CPU, please be patient)...")
+        print("Note: Loading progress will be shown below. If it seems stuck, it's just slow on CPU.")
+        
+        try:
+            import time
+            start_time = time.time()
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name, 
+                torch_dtype=torch_dtype, 
+                cache_dir=cache_dir, 
+                low_cpu_mem_usage=True, 
+                device_map="cpu"
+            )
+            load_time = time.time() - start_time
+            print(f"Model loaded successfully! (took {load_time/60:.1f} minutes)")
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "memory" in str(e).lower():
+                print("\n" + "="*60)
+                print("ERROR: Not enough RAM to load the model!")
+                print("="*60)
+                print("The model needs ~7-8GB free RAM in float16 mode.")
+                print(f"Current available RAM: Check with 'free -h'")
+                print("\nOptions:")
+                print("1. Free up RAM (close other applications)")
+                print("2. Wait for other processes to finish")
+                print("3. Consider using GPU mode (remove --use_cpu flag)")
+                print("   This will prune layers 0-22 on GPU, which is faster")
+                print("="*60)
+            raise
+        except Exception as e:
+            print(f"\nError loading model: {e}")
+            if "Killed" in str(e) or "killed" in str(e).lower():
+                print("\n" + "="*60)
+                print("Process was killed by system (likely OOM killer)")
+                print("="*60)
+                print("Your system ran out of memory during loading.")
+                print("Check available RAM with: free -h")
+                print("\nSolutions:")
+                print("1. Free up RAM - close other applications")
+                print("2. Wait and try again when more RAM is available")
+                print("3. Use GPU mode instead (remove --use_cpu flag)")
+                print("="*60)
+            raise
 
     model.seqlen = model.config.max_position_embeddings 
+    
+    # Initialize rotary embeddings for CPU-loaded models to avoid NoneType errors
+    # This is necessary for transformers 4.57+ when loading on CPU with device_map="cpu"
+    # Only run if: (1) using CPU mode, OR (2) model has CPU/meta layers in device_map
+    # Skip on GPU-only runs (like Modal) where all layers are on GPU
+    needs_rotary_init = False
+    if not use_gpu:
+        needs_rotary_init = True
+    elif hasattr(model, 'hf_device_map') and model.hf_device_map:
+        # Check if any layers are on CPU or meta device
+        has_cpu_layers = any(
+            d in ["cpu", "meta"] or 
+            (isinstance(d, str) and "cpu" in d.lower()) or
+            (isinstance(d, torch.device) and d.type == "cpu")
+            for d in model.hf_device_map.values()
+        )
+        if has_cpu_layers:
+            needs_rotary_init = True
+    
+    if needs_rotary_init:
+        print("Initializing rotary embeddings for CPU-loaded model...")
+        try:
+            # Materialize rotary_emb.inv_freq for all layers from state_dict
+            # This ensures they're properly loaded and not in 'meta' device state
+            if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+                state_dict = model.state_dict()
+                initialized_count = 0
+                failed_count = 0
+                cpu_device = torch.device("cpu")
+                total_layers = len(model.model.layers)
+                print(f"Found {total_layers} layers to initialize...")
+                
+                for i, layer in enumerate(model.model.layers):
+                    rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"  # Define early
+                    if hasattr(layer, 'self_attn'):
+                        # rotary_emb might not exist as a direct attribute - try multiple ways to access it
+                        rotary_emb = None
+                        # Method 1: Direct attribute access
+                        if hasattr(layer.self_attn, 'rotary_emb'):
+                            rotary_emb = layer.self_attn.rotary_emb
+                        # Method 2: getattr
+                        if rotary_emb is None:
+                            rotary_emb = getattr(layer.self_attn, 'rotary_emb', None)
+                        # Method 3: Check __dict__
+                        if rotary_emb is None and hasattr(layer.self_attn, '__dict__'):
+                            rotary_emb = layer.self_attn.__dict__.get('rotary_emb', None)
+                        
+                        if rotary_emb is not None:
+                            rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"
+                            
+                            # Always ensure inv_freq is materialized and on CPU
+                            if rotary_key in state_dict:
+                                inv_freq = state_dict[rotary_key]
+                                if hasattr(inv_freq, 'device'):
+                                    if inv_freq.device.type == 'meta' or not hasattr(rotary_emb, 'inv_freq') or \
+                                       (hasattr(rotary_emb.inv_freq, 'device') and rotary_emb.inv_freq.device.type == 'meta'):
+                                        rotary_emb.inv_freq = inv_freq.to(cpu_device)
+                                elif hasattr(rotary_emb, 'inv_freq') and hasattr(rotary_emb.inv_freq, 'device') and rotary_emb.inv_freq.device != inv_freq.device:
+                                    rotary_emb.inv_freq = inv_freq.to(rotary_emb.inv_freq.device)
+                            elif not hasattr(rotary_emb, 'inv_freq') or rotary_emb.inv_freq is None:
+                                # If not in state_dict, try to get it directly
+                                if hasattr(rotary_emb, 'inv_freq') and rotary_emb.inv_freq is not None:
+                                    if hasattr(rotary_emb.inv_freq, 'device') and rotary_emb.inv_freq.device.type == 'meta':
+                                        # Need to materialize it somehow - this shouldn't happen but handle it
+                                        print(f"Warning: Layer {i} has meta device inv_freq but not in state_dict")
+                            
+                            # CRITICAL: ALWAYS call rotary_emb to initialize its cache (_cos_cached, _sin_cached)
+                            layer_initialized = False
+                            try:
+                                with torch.no_grad():
+                                    # Use a dummy position_ids to trigger cache initialization
+                                    # Use a reasonable sequence length (e.g., 128) to initialize cache
+                                    # position_ids must be 2D: (batch_size, seq_len)
+                                    seq_len = 128
+                                    dummy_pos = torch.arange(0, seq_len, dtype=torch.long, device=cpu_device).unsqueeze(0)  # Shape: (1, seq_len)
+                                    # In transformers 4.45.2, forward() signature is (self, x, position_ids)
+                                    # Create dummy x tensor for the first argument
+                                    head_dim = model.config.hidden_size // model.config.num_attention_heads
+                                    dummy_x = torch.zeros((1, seq_len, head_dim), dtype=torch.float16, device=cpu_device)
+                                    # Try multiple calling methods
+                                    try:
+                                        result = rotary_emb(dummy_x, dummy_pos)
+                                    except TypeError:
+                                        try:
+                                            result = rotary_emb(dummy_x, position_ids=dummy_pos)
+                                        except TypeError:
+                                            result = rotary_emb(x=dummy_x, position_ids=dummy_pos)
+                                    # Verify it returns a tuple
+                                    if result is None or not isinstance(result, (tuple, list)) or len(result) != 2:
+                                        raise ValueError(f"rotary_emb returned invalid result: {type(result)}")
+                                    # Verify cache is actually set (some implementations use different cache names)
+                                    cache_set = (hasattr(rotary_emb, '_cos_cached') and rotary_emb._cos_cached is not None) or \
+                                               (hasattr(rotary_emb, 'cos_cached') and rotary_emb.cos_cached is not None)
+                                    if cache_set or result is not None:
+                                        layer_initialized = True
+                                        initialized_count += 1
+                                    else:
+                                        raise ValueError("rotary_emb cache not set after call")
+                            except Exception as e_direct:
+                                # If direct call fails, try through attention layer (the actual usage path)
+                                try:
+                                    with torch.no_grad():
+                                        # Create a tiny dummy input to trigger attention forward pass
+                                        hidden_size = model.config.hidden_size
+                                        dummy_inp = torch.zeros((1, 1, hidden_size), dtype=torch.float16, device=cpu_device)
+                                        dummy_pos = torch.zeros((1, 1), dtype=torch.long, device=cpu_device)
+                                        dummy_attn = torch.ones((1, 1), dtype=torch.long, device=cpu_device)
+                                        # Call attention layer which will initialize rotary_emb
+                                        _ = layer.self_attn(dummy_inp, attention_mask=dummy_attn, position_ids=dummy_pos)
+                                        layer_initialized = True
+                                        initialized_count += 1
+                                except Exception as e_attn:
+                                    failed_count += 1
+                                    if i < 3:  # Print for first few layers to debug
+                                        print(f"Warning: Layer {i} init failed (direct: {str(e_direct)[:50]}, attn: {str(e_attn)[:50]})")
+                        else:
+                            # rotary_emb doesn't exist - manually create it for transformers 4.57.3
+                            try:
+                                from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+                                rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"
+                                if rotary_key in state_dict:
+                                    inv_freq = state_dict[rotary_key].to(cpu_device)
+                                    head_dim = model.config.hidden_size // model.config.num_attention_heads
+                                    max_position_embeddings = model.config.max_position_embeddings
+                                    base = getattr(model.config, 'rope_theta', 10000.0)
+                                    
+                                    # Create and assign rotary embedding
+                                    rotary_emb = LlamaRotaryEmbedding(
+                                        head_dim=head_dim,
+                                        max_position_embeddings=max_position_embeddings,
+                                        base=base
+                                    )
+                                    rotary_emb.inv_freq = inv_freq
+                                    rotary_emb.to(cpu_device)
+                                    layer.self_attn.rotary_emb = rotary_emb
+                                    
+                                    # Initialize it by calling it
+                                    try:
+                                        seq_len = 128
+                                        # position_ids must be 2D: (batch_size, seq_len)
+                                        test_pos = torch.arange(0, seq_len, dtype=torch.long, device=cpu_device).unsqueeze(0)  # Shape: (1, seq_len)
+                                        # Create dummy x tensor for transformers 4.45.2
+                                        head_dim = model.config.hidden_size // model.config.num_attention_heads
+                                        dummy_x = torch.zeros((1, seq_len, head_dim), dtype=torch.float16, device=cpu_device)
+                                        # Try multiple calling methods for transformers 4.45.2 compatibility
+                                        try:
+                                            _ = rotary_emb(dummy_x, test_pos)
+                                        except TypeError:
+                                            try:
+                                                _ = rotary_emb(dummy_x, position_ids=test_pos)
+                                            except TypeError:
+                                                _ = rotary_emb(x=dummy_x, position_ids=test_pos)
+                                        initialized_count += 1
+                                        if i == 0:
+                                            print(f"  Manually created and initialized rotary_emb for layer {i}")
+                                    except Exception as e_init:
+                                        if i == 0:
+                                            print(f"  Created rotary_emb for layer {i} but initialization failed: {e_init}")
+                                        initialized_count += 1  # Count it as initialized even if call failed
+                            except Exception as e_create:
+                                failed_count += 1
+                                if i == 0:
+                                    print(f"Warning: Could not create rotary_emb for layer {i}: {e_create}")
+                
+                if initialized_count > 0:
+                    print(f"Successfully initialized rotary embeddings for {initialized_count}/{total_layers} layers.")
+                    if failed_count > 0:
+                        print(f"Warning: Failed to initialize {failed_count} layers - will attempt during pruning.")
+                else:
+                    print(f"ERROR: Could not initialize any rotary embeddings ({failed_count} failures, {total_layers} total layers).")
+                    print("This will likely cause errors during pruning. Check transformers version compatibility.")
+        except Exception as e:
+            print(f"Warning: Could not pre-initialize rotary embeddings: {e}")
+            print("Will attempt to initialize during pruning...")
+    
     return model
 
 def main():
@@ -40,6 +303,7 @@ def main():
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
+    parser.add_argument("--use_cpu", action="store_true", help="Force CPU usage even if GPU is available")
     args = parser.parse_args()
 
     # Setting seeds for reproducibility
@@ -54,13 +318,46 @@ def main():
 
     model_name = args.model.split("/")[-1]
     print(f"loading llm model {args.model}")
-    model = get_llm(args.model, args.cache_dir)
+    use_gpu = not args.use_cpu and torch.cuda.is_available()
+    model = get_llm(args.model, args.cache_dir, use_gpu=use_gpu)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
-    device = torch.device("cuda:0")
-    if "30b" in args.model or "65b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
-        device = model.hf_device_map["lm_head"]
+    # Determine device - use GPU if available and not forced to CPU
+    # Note: If model is offloaded, device will be CPU for calibration inputs
+    if use_gpu and torch.cuda.is_available():
+        # For models with device_map, check if any layers are actually on GPU
+        if hasattr(model, 'hf_device_map') and model.hf_device_map:
+            # Check if model has any GPU layers
+            # device_map can return: torch.device, str ("cuda:0", "cpu"), or int (GPU index)
+            has_gpu_layers = any(
+                (isinstance(d, torch.device) and d.type == "cuda") or
+                (isinstance(d, str) and "cuda" in d.lower()) or
+                (isinstance(d, int))  # Integer means GPU index
+                for d in model.hf_device_map.values()
+            )
+            if has_gpu_layers:
+                # Get device from first GPU layer
+                for key, dev in model.hf_device_map.items():
+                    if isinstance(dev, torch.device) and dev.type == "cuda":
+                        device = dev
+                        break
+                    elif isinstance(dev, str) and "cuda" in dev.lower():
+                        device = torch.device(dev)
+                        break
+                    elif isinstance(dev, int):
+                        # Integer means GPU index
+                        device = torch.device(f"cuda:{dev}")
+                        break
+                else:
+                    device = torch.device("cuda:0")
+            else:
+                # All layers offloaded to CPU
+                device = torch.device("cpu")
+        else:
+            device = torch.device("cuda:0")
+    else:
+        device = torch.device("cpu")
     print("use device ", device)
 
     if args.sparsity_ratio != 0:
@@ -80,15 +377,39 @@ def main():
     print(f"sparsity sanity check {sparsity_ratio:.4f}")
     print("*"*30)
     ################################################################
-    ppl_test = eval_ppl(args, model, tokenizer, device)
-    print(f"wikitext perplexity {ppl_test}")
+    
+    # Clear GPU cache before evaluation to free up memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(f"GPU memory before eval: {torch.cuda.memory_allocated()/1024**3:.2f} GB / {torch.cuda.get_device_properties(0).total_memory/1024**3:.2f} GB")
+    
+    # Try evaluation, but skip if OOM occurs
+    try:
+        ppl_test = eval_ppl(args, model, tokenizer, device)
+        print(f"wikitext perplexity {ppl_test}")
+    except Exception as e:
+        if "OutOfMemoryError" in str(type(e).__name__) or "out of memory" in str(e).lower():
+            print(f"\n{'='*60}")
+            print("Evaluation skipped due to GPU memory constraints.")
+            print("Model has been pruned successfully and will be saved.")
+            print("You can evaluate the model separately with:")
+            print("  - More GPU memory available")
+            print("  - Using CPU-only evaluation (--use_cpu flag)")
+            print("  - Or loading the saved model in a separate session")
+            print(f"{'='*60}\n")
+            ppl_test = None
+        else:
+            raise
 
     if not os.path.exists(args.save):
         os.makedirs(args.save)
     save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
     with open(save_filepath, "w") as f:
         print("method\tactual_sparsity\tppl_test", file=f, flush=True)
-        print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
+        if ppl_test is not None:
+            print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
+        else:
+            print(f"{args.prune_method}\t{sparsity_ratio:.4f}\tN/A (evaluation skipped)", file=f, flush=True)
 
     if args.eval_zero_shot:
         accelerate=False

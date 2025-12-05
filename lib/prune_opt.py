@@ -99,7 +99,7 @@ def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
     cur_sparsity = (W_mask==True).sum() / W_mask.numel()
     return W_mask, cur_sparsity
 
-def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"), prune_n=0, prune_m=0):
     layers = model.model.decoder.layers 
 
     for i in range(len(layers)):
@@ -116,17 +116,21 @@ def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune
                         tmp = W_metric[:,ii:(ii+prune_m)].float()
                         W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
             else:
-                thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel()*args.sparsity_ratio)].cpu()
+                # Move to device for sorting if needed (for GPU efficiency)
+                W_metric_device = W_metric.to(device) if device.type == "cuda" else W_metric
+                thresh = torch.sort(W_metric_device.flatten())[0][int(W.numel()*args.sparsity_ratio)]
+                if device.type == "cuda":
+                    thresh = thresh.cpu()
                 W_mask = (W_metric<=thresh)
 
             W[W_mask] = 0
 
-def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"), prune_n=0, prune_m=0):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
     print("loading calibdation data")
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer,load_validation=False)
     print("dataset loading complete")
     with torch.no_grad():
         inps, outs, attention_mask = prepare_calibration_input(model, dataloader, device)
@@ -183,14 +187,16 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         inps, outs = outs, inps
 
-    model.config.use_cache = use_cache 
-    torch.cuda.empty_cache()
+    model.config.use_cache = use_cache
+    # Clear CUDA cache if using GPU
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 @torch.no_grad()
 def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer,load_validation=False)
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -222,7 +228,6 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         except ValueError:
             pass
     layers[0] = layers[0].module
-    torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
@@ -267,18 +272,22 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
 
         layers[i] = layer 
-        torch.cuda.empty_cache()
+        # Clear CUDA cache periodically if using GPU
+        if torch.cuda.is_available() and (i + 1) % 5 == 0:
+            torch.cuda.empty_cache()
 
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
-    torch.cuda.empty_cache()
+    # Final cache clear
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 @torch.no_grad()
 def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer,load_validation=False)
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -310,7 +319,6 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         except ValueError:
             pass
     layers[0] = layers[0].module
-    torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
@@ -364,9 +372,13 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
 
         layers[i] = layer 
-        torch.cuda.empty_cache()
+        # Clear CUDA cache periodically if using GPU
+        if torch.cuda.is_available() and (i + 1) % 5 == 0:
+            torch.cuda.empty_cache()
 
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
-    torch.cuda.empty_cache()
+    # Final cache clear
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
