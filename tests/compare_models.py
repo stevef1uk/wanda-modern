@@ -12,7 +12,7 @@ import argparse
 import time
 import torch
 import os
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from lib.eval import eval_ppl
 from lib.prune import check_sparsity
 
@@ -157,76 +157,139 @@ def measure_inference_speed(model, tokenizer, prompts, num_runs=5, max_new_token
     }
 
 
-def load_model(model_path_or_name, cache_dir="llm_weights", use_cpu=False, is_pruned=False, load_in_8bit=False):
-    """Load either original or pruned model with proper caching and offloading."""
-    import os
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
+def load_model(model_path_or_name, cache_dir="llm_weights", use_cpu=False, is_pruned=False):
+    """Load either original or pruned model."""
     print(f"\n{'='*60}")
     print(f"Loading {'pruned' if is_pruned else 'original'} model...")
     print(f"{'='*60}")
-
-    # Resolve local path if pruned
+    
+    # Resolve path if it's a local pruned model
     if is_pruned:
         model_path_or_name = os.path.abspath(os.path.expanduser(model_path_or_name))
         if not os.path.exists(model_path_or_name):
             raise FileNotFoundError(f"Pruned model path does not exist: {model_path_or_name}")
         print(f"Loading from local path: {model_path_or_name}")
-
-    # Decide device
+    
+    # Check if accelerate is available for device_map
+    try:
+        import accelerate
+        has_accelerate = True
+    except ImportError:
+        has_accelerate = False
+        if not use_cpu and torch.cuda.is_available():
+            print("Warning: accelerate not installed. device_map='auto' requires accelerate.")
+            print("Without accelerate, the model will try to load entirely on GPU.")
+            gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            # Llama-2-7b in float16 needs ~13GB, so if GPU is smaller, warn or use CPU
+            if gpu_memory_gb < 14:
+                print(f"Warning: GPU has {gpu_memory_gb:.1f}GB, but model needs ~13GB.")
+                print("Consider installing accelerate: pip install accelerate")
+                print("Or use --use_cpu flag to run on CPU.")
+    
     if use_cpu or not torch.cuda.is_available():
-        device = "cpu"
-        device_map = None
+        device = torch.device("cpu")
+        device_map = None  # Don't use device_map without accelerate
+        torch_dtype = torch.float32
     else:
-        device = "cuda"
-        device_map = "auto"  # enables CPU offloading
-
-    # Tokenizer
-    tokenizer_kwargs = {}
+        device = torch.device("cuda:0")
+        if has_accelerate:
+            device_map = "auto"
+        else:
+            # Without accelerate, we can't use device_map, so check if model will fit
+            gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            if gpu_memory_gb < 14:
+                # Model won't fit, fall back to CPU
+                print(f"GPU too small ({gpu_memory_gb:.1f}GB < 14GB required). Using CPU instead.")
+                print("Install accelerate for GPU offloading: pip install accelerate")
+                device = torch.device("cpu")
+                device_map = None
+                torch_dtype = torch.float32
+            else:
+                device_map = None  # Fallback: manually move to device
+        torch_dtype = torch.float16
+        
+        # For original model, allow CPU offloading
+        # For pruned model on Modal, prevent offloading
+        if is_pruned and (os.getenv("MODAL_ENVIRONMENT") or os.getenv("MODAL")):
+            gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            reserved_gb = max(2.0, gpu_memory_gb * 0.15)
+            max_memory_gb = gpu_memory_gb - reserved_gb
+            max_memory = {
+                0: f"{max_memory_gb:.1f}GiB",
+                "cpu": "0GiB"  # Prevent CPU offloading
+            }
+        else:
+            gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            reserved_gb = max(2.0, gpu_memory_gb * 0.15)
+            max_memory_gb = gpu_memory_gb - reserved_gb
+            max_memory = {
+                0: f"{max_memory_gb:.1f}GiB",
+                "cpu": "50GiB"  # Allow CPU offloading
+            }
+    
+    print(f"Using device: {device}")
+    
+    # Load tokenizer
+    # For local pruned models, use local_files_only and don't pass cache_dir
     if is_pruned:
-        tokenizer_kwargs["local_files_only"] = True
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path_or_name,
-        cache_dir=None if is_pruned else cache_dir,
-        use_fast=False,
-        **tokenizer_kwargs
-    )
-
-    # Model load kwargs
-    model_kwargs = {
-        "torch_dtype": torch.float16 if not use_cpu else torch.float32,
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path_or_name,
+            local_files_only=True,
+            use_fast=False
+        )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path_or_name, 
+            cache_dir=cache_dir,
+            use_fast=False
+        )
+    
+    # Load model
+    load_kwargs = {
+        "torch_dtype": torch_dtype,
         "low_cpu_mem_usage": True,
         "trust_remote_code": True
     }
-
+    
+    # Only use device_map if accelerate is available
     if device_map is not None:
-        model_kwargs["device_map"] = device_map
-
-    if load_in_8bit:
-        model_kwargs["load_in_8bit"] = True
-
+        load_kwargs["device_map"] = device_map
+        
+        # Add max_memory only if using device_map
+        if not use_cpu and torch.cuda.is_available() and not is_pruned:
+            load_kwargs["max_memory"] = max_memory
+        
+        if is_pruned and not use_cpu and torch.cuda.is_available():
+            if os.getenv("MODAL_ENVIRONMENT") or os.getenv("MODAL"):
+                load_kwargs["max_memory"] = max_memory
+    
+    # For local pruned models, use local_files_only and don't pass cache_dir
     if is_pruned:
-        model_kwargs["local_files_only"] = True
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path_or_name,
+            local_files_only=True,
+            **load_kwargs
+        )
     else:
-        model_kwargs["cache_dir"] = cache_dir
-
-    # Load model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path_or_name,
-        **model_kwargs
-    )
-
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path_or_name,
+            cache_dir=cache_dir,
+            **load_kwargs
+        )
+    
+    # If device_map wasn't used, manually move model to device
+    if device_map is None and not use_cpu and torch.cuda.is_available():
+        model = model.to(device)
+    
     model.eval()
-
-    # Ensure seqlen attribute
-    if not hasattr(model, "seqlen"):
+    
+    # Set seqlen for evaluation
+    if not hasattr(model, 'seqlen'):
         model.seqlen = model.config.max_position_embeddings
-
-    print(f"Using device: {device}")
+    
     return model, tokenizer
 
- 
-    
+
 def main():
     parser = argparse.ArgumentParser(description="Compare original and pruned models")
     parser.add_argument(
@@ -375,17 +438,7 @@ def main():
     print("\n" + "="*60)
     print("TESTING PRUNED MODEL")
     print("="*60)
-   
-
-    # --- Extra cleanup before loading pruned model ---
-    if torch.cuda.is_available() and not args.use_cpu:
-        import gc, time
-        torch.cuda.empty_cache()
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        time.sleep(3.0)  # Increase wait time to 3 seconds for memory to settle
- 
+    
     try:
         pruned_model, pruned_tokenizer = load_model(
             args.pruned_model,
@@ -561,4 +614,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
