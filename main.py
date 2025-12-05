@@ -394,14 +394,20 @@ def main():
     ppl_test = None
     if args.skip_eval:
         print("Skipping evaluation (--skip_eval flag set)")
+        if not args.save_model:
+            print("⚠️  WARNING: Model not saved (use --save_model to save the pruned model)")
         ppl_test = None
     elif args.use_cpu:
         print(f"\n{'='*60}")
         print("⚠️  WARNING: Evaluation on CPU is very memory-intensive and may cause OOM.")
-        print("   Pruning completed successfully. Model has been saved.")
+        print("   Pruning completed successfully.")
+        if args.save_model:
+            print("   Model has been saved.")
+        else:
+            print("   ⚠️  Model NOT saved (use --save_model to save it).")
         print("   To evaluate the model:")
         print("   1. Load the saved model separately with more RAM available")
-        print("   2. Or use GPU for evaluation: python use_pruned_model.py --model_path <path>")
+        print("   2. Or use GPU for evaluation: python eval_pruned_model.py --model_path <path>")
         print("   3. Or add --skip_eval flag to skip evaluation entirely")
         print(f"{'='*60}\n")
         ppl_test = None
