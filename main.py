@@ -435,15 +435,19 @@ def main():
             else:
                 raise
 
-    if not os.path.exists(args.save):
-        os.makedirs(args.save)
-    save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
-    with open(save_filepath, "w") as f:
-        print("method\tactual_sparsity\tppl_test", file=f, flush=True)
-        if ppl_test is not None:
-            print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
-        else:
-            print(f"{args.prune_method}\t{sparsity_ratio:.4f}\tN/A (evaluation skipped)", file=f, flush=True)
+    if args.save:
+        # Handle case where path exists as a file instead of directory
+        if os.path.exists(args.save) and not os.path.isdir(args.save):
+            raise ValueError(f"Save path '{args.save}' exists but is not a directory")
+        # Create directory if it doesn't exist (exist_ok=True handles existing directories)
+        os.makedirs(args.save, exist_ok=True)
+        save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
+        with open(save_filepath, "w") as f:
+            print("method\tactual_sparsity\tppl_test", file=f, flush=True)
+            if ppl_test is not None:
+                print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
+            else:
+                print(f"{args.prune_method}\t{sparsity_ratio:.4f}\tN/A (evaluation skipped)", file=f, flush=True)
 
     if args.eval_zero_shot:
         accelerate=False
