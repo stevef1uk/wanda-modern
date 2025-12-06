@@ -405,10 +405,18 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                     sample_attn = attention_mask
                     # Generate position_ids if None
                     if position_ids is not None:
-                        sample_pos = position_ids
+                        # Ensure position_ids is on the same device as sample_inp
+                        if len(position_ids.shape) == 2:
+                            sample_pos = position_ids.to(layer_dev) if position_ids.device != layer_dev else position_ids
+                        else:
+                            sample_pos = position_ids[j:j+1].to(layer_dev) if position_ids.device != layer_dev else position_ids[j:j+1]
                     else:
                         seq_len = sample_inp.shape[1]
                         sample_pos = torch.arange(0, seq_len, dtype=torch.long, device=layer_dev).unsqueeze(0)
+                
+                # CRITICAL: Ensure sample_pos is on the same device as sample_inp
+                if sample_pos.device != sample_inp.device:
+                    sample_pos = sample_pos.to(sample_inp.device)
                 
                 # Ensure rotary_emb is on the correct device and properly initialized
                 # LLaMA layers need rotary embeddings to be accessible for position encoding
@@ -507,8 +515,14 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                             except:
                                 pass
                 
+                # CRITICAL: Ensure sample_pos is on the same device as sample_inp BEFORE any rotary_emb operations
+                # This must happen before we try to initialize or use rotary_emb
+                if sample_pos.device != sample_inp.device:
+                    sample_pos = sample_pos.to(sample_inp.device)
+                
                 # For the first sample of each layer, ensure rotary_emb is initialized by doing a dummy forward pass
                 # This is critical for LLaMA models where rotary_emb might not be fully initialized until first use
+                # In transformers 4.45.2, each attention layer has its own rotary_emb that needs to be on the correct device
                 if j == 0 and hasattr(layer, 'self_attn'):
                     # Use getattr - rotary_emb might exist but hasattr returns False
                     rotary_emb = getattr(layer.self_attn, 'rotary_emb', None)
@@ -520,32 +534,48 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                             rotary_emb = None
                     
                     if rotary_emb is not None:
-                        # First, ensure inv_freq is properly materialized
+                        # CRITICAL: Ensure the layer's rotary_emb.inv_freq is on the same device as the layer
+                        # This is necessary because when position_embeddings is None, the layer uses its own rotary_emb
                         try:
                             state_dict = model.state_dict()
                             rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"
                             if rotary_key in state_dict:
                                 inv_freq = state_dict[rotary_key]
-                                if hasattr(inv_freq, 'device') and inv_freq.device.type != 'meta':
+                                if hasattr(inv_freq, 'device'):
+                                    if inv_freq.device.type == 'meta':
+                                        rotary_emb.inv_freq = inv_freq.to(layer_dev)
+                                    elif inv_freq.device != layer_dev:
+                                        rotary_emb.inv_freq = inv_freq.to(layer_dev)
+                                    else:
+                                        rotary_emb.inv_freq = inv_freq.to(layer_dev)
+                                else:
                                     rotary_emb.inv_freq = inv_freq.to(layer_dev)
                         except Exception as e_state:
-                            pass
+                            # If state_dict access fails, try to ensure inv_freq is on correct device anyway
+                            if hasattr(rotary_emb, 'inv_freq') and hasattr(rotary_emb.inv_freq, 'device'):
+                                if rotary_emb.inv_freq.device != layer_dev:
+                                    rotary_emb.inv_freq = rotary_emb.inv_freq.to(layer_dev)
                         
                         # Now try to initialize rotary_emb by calling it directly
                         # CRITICAL: This must succeed or the layer will fail
                         init_success = False
                         try:
-                            # Ensure inv_freq exists
+                            # Ensure inv_freq exists and is on correct device
                             if not hasattr(rotary_emb, 'inv_freq') or rotary_emb.inv_freq is None:
                                 state_dict = model.state_dict()
                                 rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"
                                 if rotary_key in state_dict:
                                     rotary_emb.inv_freq = state_dict[rotary_key].to(layer_dev)
                             
+                            # Ensure inv_freq is on layer_dev
+                            if hasattr(rotary_emb, 'inv_freq') and hasattr(rotary_emb.inv_freq, 'device'):
+                                if rotary_emb.inv_freq.device != layer_dev:
+                                    rotary_emb.inv_freq = rotary_emb.inv_freq.to(layer_dev)
+                            
                             # Call rotary_emb with position_ids to initialize its cache
                             # Use the actual sequence length we'll need
                             seq_len = sample_inp.shape[1]
-                            # position_ids must be 2D: (batch_size, seq_len)
+                            # position_ids must be 2D: (batch_size, seq_len) and on layer_dev
                             test_pos = torch.arange(0, seq_len, dtype=torch.long, device=layer_dev).unsqueeze(0)  # Shape: (1, seq_len)
                             # In transformers 4.45.2, forward() signature is (self, x, position_ids)
                             # We need to pass both x (dummy input) and position_ids
@@ -582,9 +612,14 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                             try:
                                 # Do a tiny dummy forward pass through the attention module to trigger initialization
                                 # Use just 1 token to minimize overhead
-                                dummy_inp_tiny = sample_inp[:, :1]  # Just first token
-                                dummy_pos_tiny = sample_pos[:, :1] if sample_pos is not None else None
+                                # CRITICAL: Ensure dummy_pos_tiny is on layer_dev
+                                dummy_inp_tiny = sample_inp[:, :1]  # Just first token (already on layer_dev)
+                                dummy_pos_tiny = sample_pos[:, :1] if sample_pos is not None else torch.arange(0, 1, dtype=torch.long, device=layer_dev).unsqueeze(0)
+                                if dummy_pos_tiny.device != layer_dev:
+                                    dummy_pos_tiny = dummy_pos_tiny.to(layer_dev)
                                 dummy_attn_tiny = sample_attn[:, :1] if sample_attn is not None else None
+                                if dummy_attn_tiny is not None and dummy_attn_tiny.device != layer_dev:
+                                    dummy_attn_tiny = dummy_attn_tiny.to(layer_dev)
                                 with torch.no_grad():
                                     # This should trigger rotary_emb initialization
                                     _ = layer.self_attn(dummy_inp_tiny, attention_mask=dummy_attn_tiny, position_ids=dummy_pos_tiny)
@@ -596,207 +631,214 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                                 print(f"  Attention call error: {str(e_dummy)[:100]}")
                                 # Don't raise here - let the actual forward pass try and catch the error
                 
-                # Call layer with position_ids (decoder layers need it for position embeddings)
+                # CRITICAL: Ensure sample_inp and sample_pos are on layer_dev BEFORE computing position_embeddings
+                # This must happen first to avoid device mismatches when using model.model.rotary_emb
+                # The rotary_emb is shared across layers, so we need to ensure inputs are on the correct device
+                if sample_inp.device != layer_dev:
+                    sample_inp = sample_inp.to(layer_dev)
+                if sample_pos.device != layer_dev:
+                    sample_pos = sample_pos.to(layer_dev).contiguous()
+                
+                # Compute position_embeddings from position_ids using model.model.rotary_emb
+                # In transformers 4.45.2, decoder layer accepts position_ids and optional position_embeddings
+                # If position_embeddings is provided, the layer uses it instead of computing its own
+                position_embeddings = None
+                if sample_pos is not None:
+                    try:
+                        # Ensure model.model.rotary_emb exists and is initialized
+                        if hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
+                            rotary_emb = model.model.rotary_emb
+                            # CRITICAL: For offloaded layers, rotary_emb.inv_freq must be on layer_dev (CPU)
+                            # Even though rotary_emb is shared, we need to use it on the correct device for this layer
+                            # Use layer_dev as the target device (sample_inp and sample_pos are already on layer_dev)
+                            target_device = layer_dev  # Use layer_dev, not rotary_emb's current device
+                            
+                            # For offloaded layers, we need to compute position_embeddings on CPU
+                            # But model.model.rotary_emb is shared and might be on GPU
+                            # Instead of moving the shared buffer (which affects all layers),
+                            # create a temporary rotary_emb on the target device
+                            state_dict = model.state_dict()
+                            rotary_key = "model.rotary_emb.inv_freq"
+                            
+                            # Get inv_freq on target_device
+                            if rotary_key in state_dict:
+                                inv_freq = state_dict[rotary_key].to(target_device)
+                            elif hasattr(rotary_emb, 'inv_freq') and hasattr(rotary_emb.inv_freq, 'device'):
+                                inv_freq = rotary_emb.inv_freq.to(target_device)
+                            else:
+                                raise ValueError("Could not get rotary_emb.inv_freq")
+                            
+                            # Create a temporary rotary_emb module on target_device
+                            from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+                            temp_rotary_emb = LlamaRotaryEmbedding(config=model.config)
+                            temp_rotary_emb.inv_freq = inv_freq
+                            temp_rotary_emb.to(target_device)
+                            
+                            # Use temp_rotary_emb instead of the shared one
+                            rotary_emb = temp_rotary_emb
+                            
+                            # sample_inp and sample_pos are already on target_device (layer_dev) from above
+                            # Double-check to be safe
+                            if sample_inp.device != target_device:
+                                sample_inp = sample_inp.to(target_device)
+                            if sample_pos.device != target_device:
+                                sample_pos = sample_pos.to(target_device)
+                            
+                            # Compute position_embeddings: rotary_emb(hidden_states, position_ids) returns (cos, sin)
+                            # For transformers 4.45.2, rotary_emb.forward(x, position_ids) signature
+                            # Ensure both inputs are on the same device
+                            try:
+                                position_embeddings = rotary_emb(sample_inp, sample_pos)
+                            except TypeError:
+                                # Try with keyword argument
+                                try:
+                                    position_embeddings = rotary_emb(sample_inp, position_ids=sample_pos)
+                                except TypeError:
+                                    position_embeddings = rotary_emb(x=sample_inp, position_ids=sample_pos)
+                            except RuntimeError as e_dev:
+                                # Device mismatch - ensure everything is on the same device
+                                if "same device" in str(e_dev) or "device" in str(e_dev).lower():
+                                    # Get the device from sample_inp (which should be on layer_dev)
+                                    target_dev = sample_inp.device
+                                    # Ensure rotary_emb.inv_freq is on target_dev
+                                    if hasattr(rotary_emb, 'inv_freq') and hasattr(rotary_emb.inv_freq, 'device'):
+                                        if rotary_emb.inv_freq.device != target_dev:
+                                            rotary_emb.inv_freq = rotary_emb.inv_freq.to(target_dev)
+                                    # Retry
+                                    try:
+                                        position_embeddings = rotary_emb(sample_inp, sample_pos)
+                                    except TypeError:
+                                        try:
+                                            position_embeddings = rotary_emb(sample_inp, position_ids=sample_pos)
+                                        except TypeError:
+                                            position_embeddings = rotary_emb(x=sample_inp, position_ids=sample_pos)
+                                else:
+                                    raise
+                    except Exception as e_rot:
+                        # If rotary_emb computation fails, try to fix it
+                        print(f"Warning: Could not compute position_embeddings for layer {i}, sample {j}: {e_rot}")
+                        position_embeddings = None
+                
+                # CRITICAL: Final device check before calling layer - ensure everything is on layer_dev
+                # This is especially important for offloaded layers where layer_dev is CPU
+                # Create new tensors on the correct device to avoid view/slice issues
+                if sample_inp.device != layer_dev:
+                    sample_inp = sample_inp.to(layer_dev)
+                if sample_pos.device != layer_dev:
+                    # Create a new tensor on layer_dev (not a view) to ensure it's actually moved
+                    sample_pos = sample_pos.to(layer_dev).contiguous()
+                if sample_attn is not None and sample_attn.device != layer_dev:
+                    sample_attn = sample_attn.to(layer_dev)
+                
+                # Call layer with position_ids and position_embeddings
+                # In transformers 4.45.2, decoder layer accepts position_ids and optional position_embeddings
+                # If position_embeddings is None, the layer uses its own rotary_emb which must be on the same device
                 try:
-                    out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos)[0]
+                    if position_embeddings is not None:
+                        # Ensure position_embeddings tensors are also on layer_dev
+                        if isinstance(position_embeddings, (tuple, list)) and len(position_embeddings) == 2:
+                            cos, sin = position_embeddings
+                            if cos.device != layer_dev:
+                                cos = cos.to(layer_dev)
+                            if sin.device != layer_dev:
+                                sin = sin.to(layer_dev)
+                            position_embeddings = (cos, sin)
+                        out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos, position_embeddings=position_embeddings)[0]
+                    else:
+                        # Fallback: try with just position_ids (decoder layer will use its own rotary_emb)
+                        # CRITICAL: Ensure sample_pos is on the same device as the layer's rotary_emb
+                        # The layer's rotary_emb.inv_freq should be on layer_dev (CPU for offloaded layers)
+                        # Create contiguous copy to ensure it's actually on the right device (not a view)
+                        if sample_pos.device != layer_dev:
+                            sample_pos = sample_pos.to(layer_dev).contiguous()
+                        # Also ensure the layer's rotary_emb is on layer_dev
+                        # Move the entire rotary_emb module to ensure all buffers are on the correct device
+                        if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'rotary_emb'):
+                            rotary_emb = layer.self_attn.rotary_emb
+                            try:
+                                # Move the entire module to layer_dev
+                                rotary_emb.to(layer_dev)
+                            except Exception:
+                                # If moving the module fails, try moving inv_freq directly
+                                if hasattr(rotary_emb, 'inv_freq'):
+                                    if not hasattr(rotary_emb.inv_freq, 'device') or rotary_emb.inv_freq.device != layer_dev:
+                                        # Materialize from state_dict if needed
+                                        try:
+                                            state_dict = model.state_dict()
+                                            rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"
+                                            if rotary_key in state_dict:
+                                                inv_freq = state_dict[rotary_key].to(layer_dev)
+                                                rotary_emb.register_buffer('inv_freq', inv_freq, persistent=False)
+                                            elif hasattr(rotary_emb.inv_freq, 'device'):
+                                                inv_freq = rotary_emb.inv_freq.to(layer_dev)
+                                                rotary_emb.register_buffer('inv_freq', inv_freq, persistent=False)
+                                        except Exception as e_dev_fix:
+                                            # Last resort: try to move it anyway
+                                            if hasattr(rotary_emb.inv_freq, 'device'):
+                                                inv_freq = rotary_emb.inv_freq.to(layer_dev)
+                                                rotary_emb.register_buffer('inv_freq', inv_freq, persistent=False)
+                        
+                        # FINAL CHECK: Ensure sample_pos is definitely on layer_dev before calling layer
+                        # Create a new contiguous tensor to avoid any view/slice issues
+                        if sample_pos.device != layer_dev:
+                            sample_pos = torch.tensor(sample_pos.cpu().numpy(), dtype=sample_pos.dtype, device=layer_dev)
+                        # Double-check
+                        assert sample_pos.device == layer_dev, f"sample_pos device mismatch before layer call: {sample_pos.device} != {layer_dev}"
+                        
+                        out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos)[0]
                 except (TypeError, RuntimeError) as e:
                     error_str = str(e)
                     if "cannot unpack non-iterable NoneType object" in error_str or "position_embeddings" in error_str or "NoneType" in error_str:
                         # Rotary embedding issue - ensure rotary_emb is properly initialized
                         print(f"Warning: Rotary embedding issue at layer {i}, sample {j}. Error: {error_str}")
                         print(f"Attempting to fix rotary_emb...")
-                        # Try to ensure the layer's rotary_emb is properly set up
+                        # Try to recompute position_embeddings using model.model.rotary_emb
+                        # In transformers 4.55.0+, rotary_emb is at model.model.rotary_emb (shared)
                         fixed = False
-                        # rotary_emb might not exist as an attribute in transformers 4.57.3
-                        # Try multiple ways to access it
-                        rotary_emb = None
-                        if hasattr(layer, 'self_attn'):
-                            # Method 1: Direct attribute
-                            if hasattr(layer.self_attn, 'rotary_emb'):
-                                rotary_emb = layer.self_attn.rotary_emb
-                            # Method 2: getattr
-                            if rotary_emb is None:
-                                rotary_emb = getattr(layer.self_attn, 'rotary_emb', None)
-                            # Method 3: Check __dict__
-                            if rotary_emb is None and hasattr(layer.self_attn, '__dict__'):
-                                rotary_emb = layer.self_attn.__dict__.get('rotary_emb', None)
-                            # Method 4: Try to access via _modules or named_modules
-                            if rotary_emb is None:
+                        try:
+                            if hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
+                                rotary_emb = model.model.rotary_emb
+                                # CRITICAL: Ensure rotary_emb.inv_freq is on the same device as sample_inp
+                                target_device = sample_inp.device
+                                if hasattr(rotary_emb, 'inv_freq'):
+                                    if hasattr(rotary_emb.inv_freq, 'device'):
+                                        if rotary_emb.inv_freq.device.type == 'meta':
+                                            state_dict = model.state_dict()
+                                            rotary_key = "model.rotary_emb.inv_freq"
+                                            if rotary_key in state_dict:
+                                                rotary_emb.inv_freq = state_dict[rotary_key].to(target_device)
+                                        elif rotary_emb.inv_freq.device != target_device:
+                                            rotary_emb.inv_freq = rotary_emb.inv_freq.to(target_device)
+                                
+                                # Ensure sample_pos is on the same device as sample_inp
+                                if sample_pos is not None and sample_pos.device != target_device:
+                                    sample_pos = sample_pos.to(target_device)
+                                
+                                # Recompute position_embeddings
                                 try:
-                                    for name, module in layer.self_attn.named_modules():
-                                        if 'rotary' in name.lower() or 'rope' in name.lower():
-                                            rotary_emb = module
-                                            break
-                                except:
-                                    pass
-                        
-                        # If rotary_emb still doesn't exist, try to manually create/initialize it
-                        # This might be needed for transformers 4.57.3 where rotary_emb is created lazily or doesn't exist
-                        if rotary_emb is None:
-                            # Try to manually create rotary_emb from config and state_dict
-                            try:
-                                from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
-                                state_dict = model.state_dict()
-                                rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"
-                                if rotary_key in state_dict:
-                                    inv_freq = state_dict[rotary_key].to(layer_dev)
-                                    # Get config values needed for rotary embedding
-                                    # Try multiple ways to get head_dim
-                                    head_dim = None
-                                    if hasattr(layer.self_attn, 'head_dim'):
-                                        head_dim = layer.self_attn.head_dim
-                                    elif hasattr(layer.self_attn, 'config'):
-                                        head_dim = layer.self_attn.config.hidden_size // layer.self_attn.num_heads
-                                    else:
-                                        head_dim = model.config.hidden_size // model.config.num_attention_heads
-                                    
-                                    max_position_embeddings = model.config.max_position_embeddings
-                                    base = getattr(model.config, 'rope_theta', 10000.0)
-                                    
-                                    # Create rotary embedding
-                                    rotary_emb = LlamaRotaryEmbedding(
-                                        head_dim=head_dim,
-                                        max_position_embeddings=max_position_embeddings,
-                                        base=base
-                                    )
-                                    rotary_emb.inv_freq = inv_freq
-                                    rotary_emb.to(layer_dev)
-                                    # Assign it to the attention layer
-                                    layer.self_attn.rotary_emb = rotary_emb
-                                    # Try to initialize it by calling it
+                                    position_embeddings = rotary_emb(sample_inp, sample_pos)
+                                except TypeError:
                                     try:
-                                        seq_len = 128
-                                        # position_ids must be 2D: (batch_size, seq_len)
-                                        test_pos = torch.arange(0, seq_len, dtype=torch.long, device=layer_dev).unsqueeze(0)  # Shape: (1, seq_len)
-                                        # Create dummy x tensor for transformers 4.45.2
-                                        head_dim = model.config.hidden_size // model.config.num_attention_heads
-                                        dummy_x = torch.zeros((1, seq_len, head_dim), dtype=torch.float16, device=layer_dev)
-                                        try:
-                                            _ = rotary_emb(dummy_x, test_pos)
-                                        except TypeError:
-                                            try:
-                                                _ = rotary_emb(dummy_x, position_ids=test_pos)
-                                            except TypeError:
-                                                _ = rotary_emb(x=dummy_x, position_ids=test_pos)
-                                    except:
-                                        pass
-                                    if i == 0:
-                                        print(f"  Manually created and initialized rotary_emb for layer {i}")
-                                    fixed = True
-                            except Exception as e_create:
-                                if i == 0:
-                                    print(f"  Could not manually create rotary_emb: {e_create}")
-                                    import traceback
-                                    print(f"  Traceback: {traceback.format_exc()[:200]}")
-                        
-                        if rotary_emb is not None:
-                            # Try multiple approaches to fix rotary_emb
-                            try:
-                                # Approach 1: Materialize through state_dict
-                                state_dict = model.state_dict()
-                                rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"
-                                if rotary_key in state_dict:
-                                    inv_freq = state_dict[rotary_key]
-                                    if hasattr(inv_freq, 'device') and inv_freq.device.type != 'meta':
-                                        rotary_emb.inv_freq = inv_freq.to(layer_dev)
-                                        fixed = True
-                            except Exception as e1:
-                                pass
-                            
-                            # Approach 2: Try to initialize by calling it directly
-                            if not fixed:
-                                try:
-                                    dummy_pos_test = torch.arange(0, sample_inp.shape[1], dtype=torch.long, device=layer_dev)
-                                    # Create dummy x tensor for transformers 4.45.2
-                                    head_dim = model.config.hidden_size // model.config.num_attention_heads
-                                    dummy_x = torch.zeros((1, dummy_pos_test.shape[0], head_dim), dtype=sample_inp.dtype, device=layer_dev)
-                                    # Try multiple calling methods
-                                    try:
-                                        test_result = rotary_emb(dummy_x, dummy_pos_test)
+                                        position_embeddings = rotary_emb(sample_inp, position_ids=sample_pos)
                                     except TypeError:
-                                        try:
-                                            test_result = rotary_emb(dummy_x, position_ids=dummy_pos_test)
-                                        except TypeError:
-                                            test_result = rotary_emb(x=dummy_x, position_ids=dummy_pos_test)
-                                    # Verify it returns a tuple of (cos, sin)
-                                    if test_result is not None and isinstance(test_result, (tuple, list)) and len(test_result) == 2:
-                                        fixed = True
-                                except Exception as e2:
-                                    pass
-                            
-                            # Approach 3: Try to initialize through a full attention forward pass
-                            if not fixed:
-                                try:
-                                    # Do a tiny forward pass through the entire attention module
-                                    dummy_inp_small = sample_inp[:, :min(2, sample_inp.shape[1])]
-                                    dummy_pos_small = sample_pos[:, :min(2, sample_pos.shape[1])] if sample_pos is not None else None
-                                    dummy_attn_small = sample_attn[:, :min(2, sample_attn.shape[1])] if sample_attn is not None else None
-                                    with torch.no_grad():
-                                        _ = layer.self_attn(dummy_inp_small, attention_mask=dummy_attn_small, position_ids=dummy_pos_small)
-                                    # If we got here without error, rotary_emb should be initialized
+                                        position_embeddings = rotary_emb(x=sample_inp, position_ids=sample_pos)
+                                
+                                if position_embeddings is not None and isinstance(position_embeddings, (tuple, list)) and len(position_embeddings) == 2:
                                     fixed = True
-                                except Exception as e3:
-                                    pass
-                            
-                            # Approach 4: Force materialize inv_freq and call rotary_emb with proper sequence
-                            if not fixed:
-                                try:
-                                    # Ensure inv_freq is definitely materialized
-                                    if not hasattr(rotary_emb, 'inv_freq') or rotary_emb.inv_freq is None:
-                                        state_dict = model.state_dict()
-                                        rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"
-                                        if rotary_key in state_dict:
-                                            rotary_emb.inv_freq = state_dict[rotary_key].to(layer_dev)
-                                    
-                                    # Try calling with the actual sequence length we need
-                                    seq_len = sample_inp.shape[1]
-                                    # position_ids must be 2D: (batch_size, seq_len)
-                                    test_pos = torch.arange(0, seq_len, dtype=torch.long, device=layer_dev).unsqueeze(0)  # Shape: (1, seq_len)
-                                    # Call it multiple times to ensure cache is set
-                                    # Create dummy x tensor for transformers 4.45.2
-                                    head_dim = model.config.hidden_size // model.config.num_attention_heads
-                                    dummy_x = torch.zeros((1, seq_len, head_dim), dtype=sample_inp.dtype, device=layer_dev)
-                                    for _ in range(2):
-                                        # Try multiple calling methods
-                                        try:
-                                            result = rotary_emb(dummy_x, test_pos)
-                                        except TypeError:
-                                            try:
-                                                result = rotary_emb(dummy_x, position_ids=test_pos)
-                                            except TypeError:
-                                                result = rotary_emb(x=dummy_x, position_ids=test_pos)
-                                        if result is not None and isinstance(result, (tuple, list)) and len(result) == 2:
-                                            fixed = True
-                                            break
-                                except Exception as e4:
-                                    pass
+                        except Exception as e_fix:
+                            print(f"  Could not recompute position_embeddings: {e_fix}")
                         
                         if fixed:
-                            # Retry the forward pass
+                            # Retry the forward pass with computed position_embeddings
                             try:
-                                out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos)[0]
+                                out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos, position_embeddings=position_embeddings)[0]
                             except Exception as e_retry:
                                 print(f"Retry failed: {e_retry}")
                                 raise e  # Raise original error
                         else:
                             print(f"Could not fix rotary_emb, raising original error")
                             print(f"  Layer {i}, device: {layer_dev}")
-                            print(f"  has self_attn: {hasattr(layer, 'self_attn')}")
-                            if hasattr(layer, 'self_attn'):
-                                print(f"  self_attn type: {type(layer.self_attn)}")
-                                print(f"  self_attn attributes: {[a for a in dir(layer.self_attn) if not a.startswith('_')][:10]}")
-                                # Try to access rotary_emb even if hasattr says False
-                                try:
-                                    rotary_emb = getattr(layer.self_attn, 'rotary_emb', None)
-                                    if rotary_emb is not None:
-                                        print(f"  rotary_emb found via getattr: {type(rotary_emb)}")
-                                        print(f"  rotary_emb.inv_freq exists: {hasattr(rotary_emb, 'inv_freq')}")
-                                        if hasattr(rotary_emb, 'inv_freq'):
-                                            print(f"  rotary_emb.inv_freq device: {rotary_emb.inv_freq.device if hasattr(rotary_emb.inv_freq, 'device') else 'no device'}")
-                                    else:
-                                        print(f"  rotary_emb is None or doesn't exist")
-                                except Exception as e_attr:
-                                    print(f"  Error accessing rotary_emb: {e_attr}")
+                            print(f"  Model has model.model.rotary_emb: {hasattr(model, 'model') and hasattr(model.model, 'rotary_emb')}")
                             raise e
                     else:
                         raise
@@ -1027,8 +1069,86 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                         seq_len = sample_inp.shape[1]
                         sample_pos = torch.arange(0, seq_len, dtype=torch.long, device=layer_dev).unsqueeze(0)
                 
-                # Call layer with position_ids (decoder layers need it for position embeddings)
-                out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos)[0]
+                # CRITICAL: Ensure sample_inp and sample_pos are on layer_dev BEFORE computing position_embeddings
+                if sample_inp.device != layer_dev:
+                    sample_inp = sample_inp.to(layer_dev)
+                if sample_pos.device != layer_dev:
+                    sample_pos = sample_pos.to(layer_dev).contiguous()
+                
+                # Compute position_embeddings from position_ids using model.model.rotary_emb
+                # In transformers 4.45.2, decoder layer accepts position_ids and optional position_embeddings
+                position_embeddings = None
+                if sample_pos is not None:
+                    try:
+                        # Ensure model.model.rotary_emb exists and is initialized
+                        if hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
+                            rotary_emb = model.model.rotary_emb
+                            target_device = layer_dev  # Use layer_dev, not rotary_emb's current device
+                            
+                            # Create a temporary rotary_emb on target_device to avoid modifying shared buffer
+                            state_dict = model.state_dict()
+                            rotary_key = "model.rotary_emb.inv_freq"
+                            
+                            # Get inv_freq on target_device
+                            if rotary_key in state_dict:
+                                inv_freq = state_dict[rotary_key].to(target_device)
+                            elif hasattr(rotary_emb, 'inv_freq') and hasattr(rotary_emb.inv_freq, 'device'):
+                                inv_freq = rotary_emb.inv_freq.to(target_device)
+                            else:
+                                raise ValueError("Could not get rotary_emb.inv_freq")
+                            
+                            # Create a temporary rotary_emb module on target_device
+                            from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+                            temp_rotary_emb = LlamaRotaryEmbedding(config=model.config)
+                            temp_rotary_emb.inv_freq = inv_freq
+                            temp_rotary_emb.to(target_device)
+                            
+                            # Use temp_rotary_emb instead of the shared one
+                            rotary_emb = temp_rotary_emb
+                            
+                            # Compute position_embeddings: rotary_emb(hidden_states, position_ids) returns (cos, sin)
+                            try:
+                                position_embeddings = rotary_emb(sample_inp, sample_pos)
+                            except TypeError:
+                                try:
+                                    position_embeddings = rotary_emb(sample_inp, position_ids=sample_pos)
+                                except TypeError:
+                                    position_embeddings = rotary_emb(x=sample_inp, position_ids=sample_pos)
+                    except Exception as e_rot:
+                        # If rotary_emb computation fails, try to fix it
+                        print(f"Warning: Could not compute position_embeddings for layer {i}, sample {j} (second pass): {e_rot}")
+                        position_embeddings = None
+                
+                # CRITICAL: Final device check before calling layer
+                if sample_inp.device != layer_dev:
+                    sample_inp = sample_inp.to(layer_dev)
+                if sample_pos.device != layer_dev:
+                    sample_pos = torch.tensor(sample_pos.cpu().numpy(), dtype=sample_pos.dtype, device=layer_dev)
+                if sample_attn is not None and sample_attn.device != layer_dev:
+                    sample_attn = sample_attn.to(layer_dev)
+                
+                # Ensure layer's rotary_emb is on layer_dev if we're falling back to it
+                if position_embeddings is None:
+                    if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'rotary_emb'):
+                        rotary_emb = layer.self_attn.rotary_emb
+                        try:
+                            rotary_emb.to(layer_dev)
+                        except Exception:
+                            if hasattr(rotary_emb, 'inv_freq'):
+                                state_dict = model.state_dict()
+                                rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"
+                                if rotary_key in state_dict:
+                                    inv_freq = state_dict[rotary_key].to(layer_dev)
+                                    rotary_emb.register_buffer('inv_freq', inv_freq, persistent=False)
+                
+                # Call layer with position_ids and position_embeddings
+                if position_embeddings is not None:
+                    out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos, position_embeddings=position_embeddings)[0]
+                else:
+                    # Final check: ensure sample_pos is on layer_dev
+                    if sample_pos.device != layer_dev:
+                        sample_pos = torch.tensor(sample_pos.cpu().numpy(), dtype=sample_pos.dtype, device=layer_dev)
+                    out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos)[0]
                 outs[j] = out.to(inps.device)
         
         # Clear wrapped layers and handles to free memory after processing layer

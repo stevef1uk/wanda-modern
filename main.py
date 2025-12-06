@@ -133,155 +133,53 @@ def get_llm(model_name, cache_dir="llm_weights", use_gpu=True):
     if needs_rotary_init:
         print("Initializing rotary embeddings for CPU-loaded model...")
         try:
-            # Materialize rotary_emb.inv_freq for all layers from state_dict
-            # This ensures they're properly loaded and not in 'meta' device state
-            if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            # In transformers 4.55.0+, rotary_emb is stored at model.model.rotary_emb (shared across all layers)
+            # Not in each layer's self_attn like in older versions
+            if hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
                 state_dict = model.state_dict()
-                initialized_count = 0
-                failed_count = 0
                 cpu_device = torch.device("cpu")
-                total_layers = len(model.model.layers)
-                print(f"Found {total_layers} layers to initialize...")
+                rotary_emb = model.model.rotary_emb
                 
-                for i, layer in enumerate(model.model.layers):
-                    rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"  # Define early
-                    if hasattr(layer, 'self_attn'):
-                        # rotary_emb might not exist as a direct attribute - try multiple ways to access it
-                        rotary_emb = None
-                        # Method 1: Direct attribute access
-                        if hasattr(layer.self_attn, 'rotary_emb'):
-                            rotary_emb = layer.self_attn.rotary_emb
-                        # Method 2: getattr
-                        if rotary_emb is None:
-                            rotary_emb = getattr(layer.self_attn, 'rotary_emb', None)
-                        # Method 3: Check __dict__
-                        if rotary_emb is None and hasattr(layer.self_attn, '__dict__'):
-                            rotary_emb = layer.self_attn.__dict__.get('rotary_emb', None)
+                # Materialize rotary_emb.inv_freq from state_dict if it's on meta device
+                rotary_key = "model.rotary_emb.inv_freq"
+                if rotary_key in state_dict:
+                    inv_freq = state_dict[rotary_key]
+                    if hasattr(inv_freq, 'device'):
+                        if inv_freq.device.type == 'meta' or (hasattr(rotary_emb, 'inv_freq') and 
+                            hasattr(rotary_emb.inv_freq, 'device') and rotary_emb.inv_freq.device.type == 'meta'):
+                            rotary_emb.inv_freq = inv_freq.to(cpu_device)
+                        elif hasattr(rotary_emb, 'inv_freq') and rotary_emb.inv_freq.device != inv_freq.device:
+                            rotary_emb.inv_freq = inv_freq.to(rotary_emb.inv_freq.device)
+                
+                # Initialize rotary_emb by calling it with dummy inputs
+                # This ensures the cache is set up properly
+                try:
+                    with torch.no_grad():
+                        seq_len = 128
+                        dummy_pos = torch.arange(0, seq_len, dtype=torch.long, device=cpu_device).unsqueeze(0)
+                        head_dim = model.config.hidden_size // model.config.num_attention_heads
+                        dummy_x = torch.zeros((1, seq_len, head_dim), dtype=torch.float16, device=cpu_device)
                         
-                        if rotary_emb is not None:
-                            rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"
-                            
-                            # Always ensure inv_freq is materialized and on CPU
-                            if rotary_key in state_dict:
-                                inv_freq = state_dict[rotary_key]
-                                if hasattr(inv_freq, 'device'):
-                                    if inv_freq.device.type == 'meta' or not hasattr(rotary_emb, 'inv_freq') or \
-                                       (hasattr(rotary_emb.inv_freq, 'device') and rotary_emb.inv_freq.device.type == 'meta'):
-                                        rotary_emb.inv_freq = inv_freq.to(cpu_device)
-                                elif hasattr(rotary_emb, 'inv_freq') and hasattr(rotary_emb.inv_freq, 'device') and rotary_emb.inv_freq.device != inv_freq.device:
-                                    rotary_emb.inv_freq = inv_freq.to(rotary_emb.inv_freq.device)
-                            elif not hasattr(rotary_emb, 'inv_freq') or rotary_emb.inv_freq is None:
-                                # If not in state_dict, try to get it directly
-                                if hasattr(rotary_emb, 'inv_freq') and rotary_emb.inv_freq is not None:
-                                    if hasattr(rotary_emb.inv_freq, 'device') and rotary_emb.inv_freq.device.type == 'meta':
-                                        # Need to materialize it somehow - this shouldn't happen but handle it
-                                        print(f"Warning: Layer {i} has meta device inv_freq but not in state_dict")
-                            
-                            # CRITICAL: ALWAYS call rotary_emb to initialize its cache (_cos_cached, _sin_cached)
-                            layer_initialized = False
+                        # Try multiple calling methods for compatibility
+                        try:
+                            result = rotary_emb(dummy_x, dummy_pos)
+                        except TypeError:
                             try:
-                                with torch.no_grad():
-                                    # Use a dummy position_ids to trigger cache initialization
-                                    # Use a reasonable sequence length (e.g., 128) to initialize cache
-                                    # position_ids must be 2D: (batch_size, seq_len)
-                                    seq_len = 128
-                                    dummy_pos = torch.arange(0, seq_len, dtype=torch.long, device=cpu_device).unsqueeze(0)  # Shape: (1, seq_len)
-                                    # In transformers 4.45.2, forward() signature is (self, x, position_ids)
-                                    # Create dummy x tensor for the first argument
-                                    head_dim = model.config.hidden_size // model.config.num_attention_heads
-                                    dummy_x = torch.zeros((1, seq_len, head_dim), dtype=torch.float16, device=cpu_device)
-                                    # Try multiple calling methods
-                                    try:
-                                        result = rotary_emb(dummy_x, dummy_pos)
-                                    except TypeError:
-                                        try:
-                                            result = rotary_emb(dummy_x, position_ids=dummy_pos)
-                                        except TypeError:
-                                            result = rotary_emb(x=dummy_x, position_ids=dummy_pos)
-                                    # Verify it returns a tuple
-                                    if result is None or not isinstance(result, (tuple, list)) or len(result) != 2:
-                                        raise ValueError(f"rotary_emb returned invalid result: {type(result)}")
-                                    # Verify cache is actually set (some implementations use different cache names)
-                                    cache_set = (hasattr(rotary_emb, '_cos_cached') and rotary_emb._cos_cached is not None) or \
-                                               (hasattr(rotary_emb, 'cos_cached') and rotary_emb.cos_cached is not None)
-                                    if cache_set or result is not None:
-                                        layer_initialized = True
-                                        initialized_count += 1
-                                    else:
-                                        raise ValueError("rotary_emb cache not set after call")
-                            except Exception as e_direct:
-                                # If direct call fails, try through attention layer (the actual usage path)
-                                try:
-                                    with torch.no_grad():
-                                        # Create a tiny dummy input to trigger attention forward pass
-                                        hidden_size = model.config.hidden_size
-                                        dummy_inp = torch.zeros((1, 1, hidden_size), dtype=torch.float16, device=cpu_device)
-                                        dummy_pos = torch.zeros((1, 1), dtype=torch.long, device=cpu_device)
-                                        dummy_attn = torch.ones((1, 1), dtype=torch.long, device=cpu_device)
-                                        # Call attention layer which will initialize rotary_emb
-                                        _ = layer.self_attn(dummy_inp, attention_mask=dummy_attn, position_ids=dummy_pos)
-                                        layer_initialized = True
-                                        initialized_count += 1
-                                except Exception as e_attn:
-                                    failed_count += 1
-                                    if i < 3:  # Print for first few layers to debug
-                                        print(f"Warning: Layer {i} init failed (direct: {str(e_direct)[:50]}, attn: {str(e_attn)[:50]})")
+                                result = rotary_emb(dummy_x, position_ids=dummy_pos)
+                            except TypeError:
+                                result = rotary_emb(x=dummy_x, position_ids=dummy_pos)
+                        
+                        # Verify it returns a tuple
+                        if result is not None and isinstance(result, (tuple, list)) and len(result) == 2:
+                            print(f"Successfully initialized rotary embeddings (shared across all layers).")
                         else:
-                            # rotary_emb doesn't exist - manually create it for transformers 4.57.3
-                            try:
-                                from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
-                                rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"
-                                if rotary_key in state_dict:
-                                    inv_freq = state_dict[rotary_key].to(cpu_device)
-                                    head_dim = model.config.hidden_size // model.config.num_attention_heads
-                                    max_position_embeddings = model.config.max_position_embeddings
-                                    base = getattr(model.config, 'rope_theta', 10000.0)
-                                    
-                                    # Create and assign rotary embedding
-                                    rotary_emb = LlamaRotaryEmbedding(
-                                        head_dim=head_dim,
-                                        max_position_embeddings=max_position_embeddings,
-                                        base=base
-                                    )
-                                    rotary_emb.inv_freq = inv_freq
-                                    rotary_emb.to(cpu_device)
-                                    layer.self_attn.rotary_emb = rotary_emb
-                                    
-                                    # Initialize it by calling it
-                                    try:
-                                        seq_len = 128
-                                        # position_ids must be 2D: (batch_size, seq_len)
-                                        test_pos = torch.arange(0, seq_len, dtype=torch.long, device=cpu_device).unsqueeze(0)  # Shape: (1, seq_len)
-                                        # Create dummy x tensor for transformers 4.45.2
-                                        head_dim = model.config.hidden_size // model.config.num_attention_heads
-                                        dummy_x = torch.zeros((1, seq_len, head_dim), dtype=torch.float16, device=cpu_device)
-                                        # Try multiple calling methods for transformers 4.45.2 compatibility
-                                        try:
-                                            _ = rotary_emb(dummy_x, test_pos)
-                                        except TypeError:
-                                            try:
-                                                _ = rotary_emb(dummy_x, position_ids=test_pos)
-                                            except TypeError:
-                                                _ = rotary_emb(x=dummy_x, position_ids=test_pos)
-                                        initialized_count += 1
-                                        if i == 0:
-                                            print(f"  Manually created and initialized rotary_emb for layer {i}")
-                                    except Exception as e_init:
-                                        if i == 0:
-                                            print(f"  Created rotary_emb for layer {i} but initialization failed: {e_init}")
-                                        initialized_count += 1  # Count it as initialized even if call failed
-                            except Exception as e_create:
-                                failed_count += 1
-                                if i == 0:
-                                    print(f"Warning: Could not create rotary_emb for layer {i}: {e_create}")
-                
-                if initialized_count > 0:
-                    print(f"Successfully initialized rotary embeddings for {initialized_count}/{total_layers} layers.")
-                    if failed_count > 0:
-                        print(f"Warning: Failed to initialize {failed_count} layers - will attempt during pruning.")
-                else:
-                    print(f"ERROR: Could not initialize any rotary embeddings ({failed_count} failures, {total_layers} total layers).")
-                    print("This will likely cause errors during pruning. Check transformers version compatibility.")
+                            print(f"Warning: rotary_emb returned unexpected result: {type(result)}")
+                except Exception as e_init:
+                    print(f"Warning: Could not initialize rotary_emb by calling it: {e_init}")
+                    print("Will attempt to initialize during pruning...")
+            else:
+                print("Warning: model.model.rotary_emb not found - rotary embeddings may not be initialized.")
+                print("Will attempt to initialize during pruning...")
         except Exception as e:
             print(f"Warning: Could not pre-initialize rotary embeddings: {e}")
             print("Will attempt to initialize during pruning...")
@@ -436,11 +334,19 @@ def main():
                 raise
 
     if args.save:
+        # Normalize the path to handle trailing slashes
+        save_path = os.path.normpath(args.save)
         # Handle case where path exists as a file instead of directory
-        if os.path.exists(args.save) and not os.path.isdir(args.save):
-            raise ValueError(f"Save path '{args.save}' exists but is not a directory")
+        if os.path.exists(save_path):
+            if os.path.isfile(save_path):
+                # Remove the file if it exists as a file
+                os.remove(save_path)
+            elif not os.path.isdir(save_path):
+                raise ValueError(f"Save path '{save_path}' exists but is not a directory or file")
         # Create directory if it doesn't exist (exist_ok=True handles existing directories)
-        os.makedirs(args.save, exist_ok=True)
+        os.makedirs(save_path, exist_ok=True)
+        # Update args.save to use normalized path for consistency
+        args.save = save_path
         save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
         with open(save_filepath, "w") as f:
             print("method\tactual_sparsity\tppl_test", file=f, flush=True)

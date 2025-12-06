@@ -21,7 +21,20 @@ image = (
         "numpy>=2.3.3",
         "protobuf>=6.32.1",
     )
-    .add_local_dir(".", "/workspace")  # Mount local code directory
+    # Only mount necessary code files, not large directories like llm_weights, modal-env, etc.
+    .add_local_file("main.py", "/workspace/main.py")
+    .add_local_file("main_opt.py", "/workspace/main_opt.py")
+    .add_local_file("eval_pruned_model.py", "/workspace/eval_pruned_model.py")
+    .add_local_dir("lib", "/workspace/lib")
+    .add_local_dir("dense_ft", "/workspace/dense_ft")
+    .add_local_dir("lora_ft", "/workspace/lora_ft")
+    .add_local_dir("image_classifiers", "/workspace/image_classifiers")
+    .add_local_dir("scripts", "/workspace/scripts")
+    .add_local_dir("tests", "/workspace/tests")
+    .add_local_file("pyproject.toml", "/workspace/pyproject.toml")
+    .add_local_file("README.md", "/workspace/README.md")
+    .add_local_file("INSTALL.md", "/workspace/INSTALL.md")
+    .add_local_file("LICENSE", "/workspace/LICENSE")
 )
 
 # Create a Modal app
