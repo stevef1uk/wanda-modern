@@ -1550,10 +1550,26 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                 outs[j] = out.to(inps.device)
         
         # Clear wrapped layers and handles to free memory after processing layer
-        del wrapped_layers
+        # CRITICAL: Remove all hooks BEFORE deleting wrapped_layers to avoid NameError during evaluation
+        # Hooks are closures that capture wrapped_layers, so they must be removed first
         for h in handles:
-            h.remove()
+            try:
+                h.remove()
+            except:
+                pass
         del handles
+        
+        # Also remove any remaining hooks from attention/MLP layers that might have been registered
+        # Clear hooks from all modules in subset to ensure nothing is left behind
+        for name in subset:
+            module = subset[name]
+            if hasattr(module, '_forward_hooks'):
+                module._forward_hooks.clear()
+            if hasattr(module, '_forward_pre_hooks'):
+                module._forward_pre_hooks.clear()
+        
+        # Now safe to delete wrapped_layers
+        del wrapped_layers
         
         # For CPU mode, force garbage collection after each layer
         if device.type == "cpu":

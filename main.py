@@ -328,10 +328,18 @@ def main():
         print(f"{'='*60}\n")
         ppl_test = None
     else:
-        # Clear GPU cache before evaluation to free up memory
+        # Clear GPU cache aggressively before evaluation to free up memory
         if torch.cuda.is_available():
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            # Force garbage collection again after sync
+            gc.collect()
             torch.cuda.empty_cache()
             print(f"GPU memory before eval: {torch.cuda.memory_allocated()/1024**3:.2f} GB / {torch.cuda.get_device_properties(0).total_memory/1024**3:.2f} GB")
+            free_memory = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / (1024**3)
+            print(f"Free GPU memory: {free_memory:.2f} GB")
         
         # Try evaluation, but skip if OOM occurs
         try:

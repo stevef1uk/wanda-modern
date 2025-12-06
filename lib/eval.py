@@ -18,9 +18,16 @@ def eval_ppl(args, model, tokenizer, device=torch.device("cuda:0" if torch.cuda.
     # Print status
     print(f"evaluating on {dataset}")
 
+    # Cap sequence length for evaluation to avoid OOM
+    # Large models (like gpt-oss-20b) have max_position_embeddings=131072 which is too long
+    # Use 2048 for evaluation (same as calibration) - sufficient for perplexity evaluation
+    eval_seqlen = min(model.seqlen, 2048)
+    if model.seqlen > 2048:
+        print(f"Note: Model supports {model.seqlen} tokens, but using {eval_seqlen} for evaluation (sufficient for perplexity)")
+
     # Get the test loader
     _, testloader = get_loaders(
-        dataset, seed=0, seqlen=model.seqlen, tokenizer=tokenizer 
+        dataset, seed=0, seqlen=eval_seqlen, tokenizer=tokenizer 
     )
 
     # Evaluate ppl in no grad context to avoid updating the model
@@ -82,11 +89,24 @@ def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
 
 # Function to evaluate perplexity (ppl) specifically on the wikitext dataset
 def eval_ppl_wikitext(model, testenc, bs=1, device=None):
+    # For large models, use smaller batch size to avoid OOM
+    # Reduce batch size if model is very large (20B+ parameters)
+    if hasattr(model, 'config') and hasattr(model.config, 'hidden_size'):
+        # Rough estimate: if hidden_size is large, reduce batch size
+        if model.config.hidden_size >= 5120:  # 20B+ models typically have hidden_size >= 5120
+            bs = 1
+            print(f"Using batch size {bs} for evaluation (large model detected)")
     # Get input IDs
     testenc = testenc.input_ids
 
+    # Use actual sequence length from testenc, not model.seqlen (which might be 131k)
+    # The testenc was created with eval_seqlen (capped at 2048), so use that
+    actual_seqlen = testenc.shape[1] if len(testenc.shape) > 1 else model.seqlen
+    # Cap at reasonable limit
+    actual_seqlen = min(actual_seqlen, 2048)
+    
     # Calculate number of samples
-    nsamples = testenc.numel() // model.seqlen
+    nsamples = testenc.numel() // actual_seqlen
 
     # Determine input device - if model has offloaded layers, use CPU for inputs
     # to avoid OOM when materializing offloaded layers
@@ -139,8 +159,8 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
         j = min(i+bs, nsamples)
 
         # Prepare inputs and move to device
-        inputs = testenc[:,(i * model.seqlen):(j * model.seqlen)].to(input_device)
-        inputs = inputs.reshape(j-i, model.seqlen)
+        inputs = testenc[:,(i * actual_seqlen):(j * actual_seqlen)].to(input_device)
+        inputs = inputs.reshape(j-i, actual_seqlen)
 
         # Forward pass through the model
         try:
@@ -192,7 +212,7 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
         loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
 
         # Calculate negative log likelihood
-        neg_log_likelihood = loss.float() * model.seqlen * (j-i)
+        neg_log_likelihood = loss.float() * actual_seqlen * (j-i)
 
         # Append to list of negative log likelihoods
         nlls.append(neg_log_likelihood)
@@ -202,7 +222,7 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
             torch.cuda.empty_cache()
 
     # Compute perplexity
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * actual_seqlen))
 
     # Clear CUDA cache if using GPU
     if torch.cuda.is_available():
