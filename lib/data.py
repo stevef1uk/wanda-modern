@@ -3,7 +3,9 @@
 import numpy as np
 import random
 import torch
+import time
 from datasets import load_dataset
+import requests
 
 # Set seed for reproducibility
 def set_seed(seed):
@@ -39,24 +41,64 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer):
 
 # Load and process c4 dataset
 def get_c4(nsamples, seed, seqlen, tokenizer, load_validation=True):
+    # Cap calibration sequence length to reasonable value (2048 tokens)
+    # Even if model supports longer sequences, calibration doesn't need them
+    # This avoids issues with datasets that don't have very long samples
+    max_calib_seqlen = 2048
+    calib_seqlen = min(seqlen, max_calib_seqlen)
+    if seqlen > max_calib_seqlen:
+        print(f"Note: Model supports {seqlen} tokens, but using {calib_seqlen} for calibration (sufficient for pruning)")
+    
     # Load train dataset (always needed for calibration)
-    traindata = load_dataset('allenai/c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train')
+    print(f"Loading C4 dataset for calibration (this may take a few minutes)...")
+    # Add retry logic for network timeouts
+    import time
+    max_retries = 3
+    retry_delay = 5
+    for attempt in range(max_retries):
+        try:
+            traindata = load_dataset('allenai/c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train')
+            break
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError, Exception) as e:
+            if attempt < max_retries - 1:
+                print(f"Dataset download timed out (attempt {attempt + 1}/{max_retries}). Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                print(f"Failed to load C4 dataset after {max_retries} attempts.")
+                print("This is likely a network timeout issue. Please try again later.")
+                raise
+    print(f"C4 dataset loaded: {len(traindata)} examples available")
 
     # Generate samples from training set
+    print(f"Generating {nsamples} calibration samples (length: {calib_seqlen} tokens)...")
     random.seed(seed)
     trainloader = []
-    for _ in range(nsamples):
+    for sample_idx in range(nsamples):
+        attempts = 0
         while True:
             i = random.randint(0, len(traindata) - 1)
             trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
-            if trainenc.input_ids.shape[1] > seqlen:
+            if trainenc.input_ids.shape[1] > calib_seqlen:
                 break
-        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
+            attempts += 1
+            if attempts > 1000:  # Safety limit to avoid infinite loop
+                print(f"Warning: Having trouble finding samples > {calib_seqlen} tokens after {attempts} attempts")
+                # Use whatever length we have, pad if needed
+                if trainenc.input_ids.shape[1] > calib_seqlen // 2:
+                    break
+        i = random.randint(0, max(0, trainenc.input_ids.shape[1] - calib_seqlen - 1))
+        j = min(i + calib_seqlen, trainenc.input_ids.shape[1])
         inp = trainenc.input_ids[:, i:j]
+        # Pad to calib_seqlen if needed
+        if inp.shape[1] < calib_seqlen:
+            padding = torch.zeros((1, calib_seqlen - inp.shape[1]), dtype=inp.dtype)
+            inp = torch.cat([inp, padding], dim=1)
         tar = inp.clone()
         tar[:, :-1] = -100
         trainloader.append((inp, tar))
+        if (sample_idx + 1) % max(1, nsamples // 4) == 0 or sample_idx == nsamples - 1:
+            print(f"  Generated {sample_idx + 1}/{nsamples} calibration samples")
 
     # Only load validation dataset if requested (not needed for pruning/calibration)
     if load_validation:

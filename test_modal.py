@@ -14,7 +14,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         "torch>=2.8.0",
-        "transformers==4.45.2",  # Exact version from pyproject.toml
+        "transformers>=4.46.0",  # Need 4.46.0+ for gpt_oss support
         "accelerate>=1.10.1",
         "datasets>=4.1.1",
         "sentencepiece>=0.2.1",
@@ -38,14 +38,14 @@ image = (
 )
 
 # Create a Modal app
-app = modal.App("wanda-pruning-test", image=image)
+app = modal.App("wanda-pruning-test1", image=image)
 
 # Define a volume for model cache and outputs
 volume = modal.Volume.from_name("wanda-cache", create_if_missing=True)
 
 @app.function(
     image=image,
-    gpu="A100-40GB",  # Use A100 with 40GB (or "A100-80GB" for 80GB)
+    gpu="H100",  # Use H100 with 80GB (more memory for large models)
     volumes={"/cache": volume},
     timeout=3600,  # 1 hour timeout
     secrets=[modal.Secret.from_name("hf-secret")],  # For HuggingFace token
@@ -114,13 +114,13 @@ def test_gpu_pruning(vol: modal.Volume):
     # If you see stale code, run: MODAL_IGNORE_CACHE=true modal run test_modal.py
     cmd = [
         "python", "main.py",
-        "--model", "meta-llama/Llama-2-7b-hf",
+        "--model", "openai/gpt-oss-20b",
         "--prune_method", "wanda",
         "--sparsity_ratio", "0.6",
         "--sparsity_type", "unstructured",
         "--nsamples", "8",
         "--save", "./out/",
-        "--save_model", "./workspace/pruned_models/llama_7b_test",
+        "--save_model", "./workspace/pruned_models/gptt-oss-20b",
         "--cache_dir", "./llm_weights",
         "--use_variant",
     ]
@@ -131,17 +131,30 @@ def test_gpu_pruning(vol: modal.Volume):
     print(f"Command: {' '.join(cmd)}")
     print("=" * 60)
     
-    # Run the command - capture output so we can show errors if it fails
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Run the command with real-time output streaming
+    # This allows us to see progress as the model downloads and loads
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # Combine stderr into stdout
+        text=True,
+        bufsize=1,  # Line buffered
+        universal_newlines=True
+    )
     
-    # Print output in real-time style (for better visibility)
-    if result.stdout:
-        print(result.stdout)
-    if result.stderr:
-        print(result.stderr, file=sys.stderr)
+    # Stream output in real-time
+    stdout_lines = []
+    for line in process.stdout:
+        print(line, end='', flush=True)  # Print immediately
+        stdout_lines.append(line)
+    
+    # Wait for process to complete
+    returncode = process.wait()
+    stdout = ''.join(stdout_lines)
+    stderr = ''  # Already captured in stdout
     
     # Check results
-    if result.returncode == 0:
+    if returncode == 0:
         print("\n" + "=" * 60)
         print("✅ TEST PASSED: Pruning completed successfully!")
         print("=" * 60)
@@ -165,10 +178,10 @@ def test_gpu_pruning(vol: modal.Volume):
                     print(f"  Copied directory: {f.name}")
         
         # Copy pruned model to volume
-        model_dir = pathlib.Path("./workspace/pruned_models/llama_7b_test")
+        model_dir = pathlib.Path("./workspace/pruned_models/gptt-oss-20b")
         if model_dir.exists():
-            print(f"\nCopying pruned model to /cache/pruned_models/llama_7b_test...")
-            cache_model = pathlib.Path("/cache/pruned_models/llama_7b_test")
+            print(f"\nCopying pruned model to /cache/pruned_models/gptt-oss-20b...")
+            cache_model = pathlib.Path("/cache/pruned_models/gptt-oss-20b-_test")
             cache_model.parent.mkdir(parents=True, exist_ok=True)
             if cache_model.exists():
                 shutil.rmtree(cache_model)
@@ -186,17 +199,17 @@ def test_gpu_pruning(vol: modal.Volume):
         print("\n" + "=" * 60)
         print("❌ TEST FAILED: Pruning encountered errors")
         print("=" * 60)
-        if result.stdout:
+        if stdout:
             print("\nSTDOUT:")
-            print(result.stdout)
-        if result.stderr:
+            print(stdout)
+        if stderr:
             print("\nSTDERR:")
-            print(result.stderr)
-        print(f"\nExit code: {result.returncode}")
+            print(stderr)
+        print(f"\nExit code: {returncode}")
         print("=" * 60)
         sys.exit(1)
     
-    return result.returncode
+    return returncode
 
 @app.local_entrypoint()
 def main():

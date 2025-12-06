@@ -11,5 +11,5 @@ dependencies = [
     "protobuf>=6.32.1",
     "sentencepiece>=0.2.1",
     "torch>=2.8.0",
-    "transformers==4.45.2",
+    "transformers>=4.46.0",  # Need 4.46.0+ for gpt_oss support
 ]

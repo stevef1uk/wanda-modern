@@ -2,7 +2,7 @@ import argparse
 import os 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from importlib.metadata import version
 
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
@@ -28,38 +28,46 @@ def get_llm(model_name, cache_dir="llm_weights", use_gpu=True):
     if use_gpu and torch.cuda.is_available():
         # Calculate GPU memory limits - reserve some for operations
         gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        # Reserve ~2GB for operations (pruning needs temporary memory for sorting, etc.)
+        
+        # Load config explicitly with trust_remote_code for custom architectures
+        config = AutoConfig.from_pretrained(
+            model_name,
+            cache_dir=cache_dir,
+            trust_remote_code=True
+        )
+        
+        # Reserve some GPU memory for operations (pruning needs temporary memory for sorting, etc.)
         reserved_gb = max(2.0, gpu_memory_gb * 0.15)  # Reserve 15% or at least 2GB for pruning operations
         max_memory_gb = gpu_memory_gb - reserved_gb
         
         if is_modal:
             # On Modal, prevent CPU offloading to avoid rotary_emb initialization issues
-            # This ensures rotary_emb modules are properly initialized on GPU
+            # H100 (80GB) has enough memory for large models without offloading
             print(f"Modal environment detected: Preventing CPU offloading to avoid rotary_emb issues")
             max_memory = {
                 0: f"{max_memory_gb:.1f}GiB",
                 "cpu": "0GiB"  # Disable CPU offloading on Modal
             }
+            print(f"GPU detected: {gpu_memory_gb:.2f} GB total, reserving {reserved_gb:.1f} GB")
+            print(f"Model will use up to {max_memory_gb:.1f} GB GPU memory (CPU offloading disabled)")
         else:
             # Set max_memory to allow CPU offloading if GPU runs out (for local runs)
             max_memory = {
                 0: f"{max_memory_gb:.1f}GiB",
                 "cpu": "50GiB"  # Allow CPU offloading with 50GB limit
             }
-        
-        print(f"GPU detected: {gpu_memory_gb:.2f} GB total, reserving {reserved_gb:.1f} GB")
-        if is_modal:
-            print(f"Model will use up to {max_memory_gb:.1f} GB GPU memory (CPU offloading disabled)")
-        else:
+            print(f"GPU detected: {gpu_memory_gb:.2f} GB total, reserving {reserved_gb:.1f} GB")
             print(f"Model will use up to {max_memory_gb:.1f} GB GPU memory, with CPU offloading as fallback")
         
         model = AutoModelForCausalLM.from_pretrained(
             model_name, 
+            config=config,
             torch_dtype=torch_dtype, 
             cache_dir=cache_dir, 
             low_cpu_mem_usage=True, 
             device_map="auto",
-            max_memory=max_memory
+            max_memory=max_memory,
+            trust_remote_code=True
         )
     else:
         print("Using CPU (GPU not available or disabled)")
@@ -72,12 +80,22 @@ def get_llm(model_name, cache_dir="llm_weights", use_gpu=True):
         try:
             import time
             start_time = time.time()
+            
+            # Load config explicitly with trust_remote_code for custom architectures
+            config = AutoConfig.from_pretrained(
+                model_name,
+                cache_dir=cache_dir,
+                trust_remote_code=True
+            )
+            
             model = AutoModelForCausalLM.from_pretrained(
-                model_name, 
+                model_name,
+                config=config,
                 torch_dtype=torch_dtype, 
                 cache_dir=cache_dir, 
                 low_cpu_mem_usage=True, 
-                device_map="cpu"
+                device_map="cpu",
+                trust_remote_code=True
             )
             load_time = time.time() - start_time
             print(f"Model loaded successfully! (took {load_time/60:.1f} minutes)")

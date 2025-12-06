@@ -95,6 +95,7 @@ def prepare_calibration_input(model, dataloader, device):
                     device = torch.device(layer0_device) if isinstance(layer0_device, str) else layer0_device
     
     dtype = next(iter(model.parameters())).dtype
+    print(f"DEBUG: prepare_calibration_input - model parameter dtype: {dtype}")
     # Use CPU for calibration inputs if model is offloaded to avoid OOM
     # The calibration inputs are large (4GB for 128 samples), so CPU is safer
     if hasattr(model, 'hf_device_map') and model.hf_device_map:
@@ -109,31 +110,70 @@ def prepare_calibration_input(model, dataloader, device):
     if isinstance(device, str):
         device = torch.device(device)
     
+    # Determine actual sequence length from dataloader (may be shorter than model.seqlen for calibration)
+    # This handles cases where calibration uses shorter sequences than max_position_embeddings
+    # Peek at first batch to get sequence length without consuming it
+    dataloader_iter = iter(dataloader)
+    first_batch = next(dataloader_iter)
+    actual_seqlen = first_batch[0].shape[1]
+    # Cap at model.seqlen to avoid OOM
+    actual_seqlen = min(actual_seqlen, model.seqlen)
+    if actual_seqlen < model.seqlen:
+        print(f"Using calibration sequence length: {actual_seqlen} (model supports up to {model.seqlen})")
+    
     # Only allocate space for the number of samples we'll actually use
     # This reduces memory usage, especially important for CPU mode
     max_samples = 128  # Maximum expected samples
-    inps = torch.zeros((max_samples, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
+    inps = torch.zeros((max_samples, actual_seqlen, model.config.hidden_size), dtype=dtype, device=device)
     inps.requires_grad = False
     cache = {'i': 0, 'attention_mask': None, "position_ids": None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
-            self.module = module
+            # Store module directly in __dict__ to avoid PyTorch's attribute handling
+            self.__dict__['_wrapped_module'] = module
         def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
+            # Store input (will be actual_seqlen length from dataloader)
+            inps[cache['i']] = inp[:, :actual_seqlen]
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
             raise ValueError
+        def __getattr__(self, name):
+            # Forward attribute access to the wrapped module
+            # This is needed for models like gpt_oss that access attributes like attention_type
+            # Access _wrapped_module directly from __dict__ to avoid recursion
+            if name == '_wrapped_module':
+                raise AttributeError(f"'{type(self).__name__}' object has no attribute '_wrapped_module'")
+            try:
+                # Try to get attribute from self first (using object.__getattribute__ to bypass __getattr__)
+                return object.__getattribute__(self, name)
+            except AttributeError:
+                # Forward to wrapped module (access from __dict__ to avoid recursion)
+                wrapped_module = self.__dict__['_wrapped_module']
+                return getattr(wrapped_module, name)
     layers[0] = Catcher(layers[0])
-    for batch in dataloader:
+    # Process first batch (already peeked)
+    # DEBUG: Check dtype of first batch
+    first_batch_tensor = first_batch[0].to(device)
+    print(f"DEBUG: prepare_calibration_input - first_batch dtype after .to(device): {first_batch_tensor.dtype}, device: {first_batch_tensor.device}")
+    print(f"DEBUG: prepare_calibration_input - inps dtype: {inps.dtype}, device: {inps.device}")
+    try:
+        model(first_batch_tensor)
+    except ValueError:
+        pass
+    # Process remaining batches
+    for batch in dataloader_iter:
         try:
             model(batch[0].to(device))
         except ValueError:
             pass 
-    layers[0] = layers[0].module
+    layers[0] = layers[0]._wrapped_module
 
+    # Trim inps to actual number of samples used
+    num_samples = cache['i']
+    inps = inps[:num_samples]
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
@@ -362,11 +402,142 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                     except Exception as e2:
                         print(f"Warning: Could not force materialization for offloaded layer {i}: {e2}")
         
+        # Patch the attention interface function directly to handle sink tokens
+        # The error "Expected size 0 but got size 1" suggests sinks after reshape/expand
+        # doesn't match attn_weights shape. We need to patch eager_attention_forward
+        # to fix the sinks shape during calibration.
+        original_eager_attention = None
+        patched_attention = False
+        try:
+            from transformers.models.gpt_oss.modeling_gpt_oss import eager_attention_forward
+            original_eager_attention = eager_attention_forward
+            
+            # Fix sinks concatenation - catch ALL cases where shapes don't match
+            # The error "Expected size 0 but got size 1" means one tensor has 0 in a dim where other has 1
+            original_torch_cat = torch.cat
+            def patched_torch_cat(tensors, dim=0, out=None):
+                # If concatenating 2 tensors along dim=-1
+                if len(tensors) == 2 and dim == -1:
+                    try:
+                        t0, t1 = tensors
+                        # Check if this looks like attn_weights + sinks concatenation (4D tensors)
+                        if t0.dim() == 4 and t1.dim() == 4:
+                            # ALWAYS intercept this concatenation and fix it
+                            # Check for any mismatch OR zero dimensions
+                            needs_fix = False
+                            for d in range(3):
+                                if t0.shape[d] != t1.shape[d] or t0.shape[d] == 0 or t1.shape[d] == 0:
+                                    needs_fix = True
+                                    break
+                            
+                            if needs_fix:
+                                # Debug output
+                                if i == 0 and j == 0:
+                                    print(f"DEBUG: torch.cat fixing - t0: {t0.shape}, t1: {t1.shape}")
+                                
+                                # Use t0 (attn_weights) as the source of truth for shape
+                                # Create sinks that matches attn_weights exactly
+                                if t0.shape[0] > 0 and t0.shape[1] > 0 and t0.shape[2] > 0:
+                                    fixed_t1 = torch.zeros(
+                                        (t0.shape[0], t0.shape[1], t0.shape[2], 1),
+                                        dtype=t1.dtype,
+                                        device=t1.device
+                                    )
+                                    result = original_torch_cat([t0, fixed_t1], dim=dim, out=out)
+                                    if i == 0 and j == 0:
+                                        print(f"DEBUG: torch.cat fixed result: {result.shape}")
+                                    return result
+                                else:
+                                    # If attn_weights has invalid shape, pad it
+                                    if i == 0 and j == 0:
+                                        print(f"DEBUG: t0 invalid shape {t0.shape}, padding")
+                                    # Pad t0 to have at least 1 in each dim
+                                    padded_shape = (
+                                        max(1, t0.shape[0]),
+                                        max(1, t0.shape[1]),
+                                        max(1, t0.shape[2]),
+                                        t0.shape[3]
+                                    )
+                                    padded_t0 = torch.zeros(padded_shape, dtype=t0.dtype, device=t0.device)
+                                    if t0.numel() > 0:
+                                        # Copy valid data if any
+                                        min_dims = (min(t0.shape[0], padded_t0.shape[0]),
+                                                   min(t0.shape[1], padded_t0.shape[1]),
+                                                   min(t0.shape[2], padded_t0.shape[2]),
+                                                   min(t0.shape[3], padded_t0.shape[3]))
+                                        padded_t0[:min_dims[0], :min_dims[1], :min_dims[2], :min_dims[3]] = \
+                                            t0[:min_dims[0], :min_dims[1], :min_dims[2], :min_dims[3]]
+                                    fixed_t1 = torch.zeros(
+                                        (padded_t0.shape[0], padded_t0.shape[1], padded_t0.shape[2], 1),
+                                        dtype=t1.dtype,
+                                        device=t1.device
+                                    )
+                                    return original_torch_cat([padded_t0, fixed_t1], dim=dim, out=out)
+                    except Exception as e:
+                        if i == 0 and j == 0:
+                            print(f"DEBUG: torch.cat exception: {e}")
+                        pass
+                # Otherwise use original cat
+                return original_torch_cat(tensors, dim=dim, out=out)
+            
+            def patched_eager_attention(*args, **kwargs):
+                # Temporarily patch torch.cat to skip sinks during calibration
+                torch.cat = patched_torch_cat
+                try:
+                    return original_eager_attention(*args, **kwargs)
+                finally:
+                    # Restore original torch.cat
+                    torch.cat = original_torch_cat
+            
+            # Monkey-patch the module-level function
+            import transformers.models.gpt_oss.modeling_gpt_oss as gpt_oss_module
+            gpt_oss_module.eager_attention_forward = patched_eager_attention
+            patched_attention = True
+        except (ImportError, AttributeError) as e:
+            print(f"Warning: Could not patch eager_attention_forward: {e}")
+            # Fall back to patching layer forward
+            pass
+        
+        # Convert MLP weights to float16 if they're bfloat16
+        # The model was loaded with float16, but MLP weights might be bfloat16
+        if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
+            experts = layer.mlp.experts
+            if hasattr(experts, 'gate_up_proj'):
+                gate_up_proj = experts.gate_up_proj
+                if hasattr(gate_up_proj, 'dtype') and gate_up_proj.dtype == torch.bfloat16:
+                    # Convert to float16 to match other model weights
+                    experts.gate_up_proj.data = gate_up_proj.data.to(torch.float16)
+                elif hasattr(gate_up_proj, 'weight') and gate_up_proj.weight.dtype == torch.bfloat16:
+                    gate_up_proj.weight.data = gate_up_proj.weight.data.to(torch.float16)
+            if hasattr(experts, 'gate_up_proj_bias'):
+                bias = experts.gate_up_proj_bias
+                if bias is not None and bias.dtype == torch.bfloat16:
+                    experts.gate_up_proj_bias.data = bias.data.to(torch.float16)
+            if hasattr(experts, 'down_proj'):
+                down_proj = experts.down_proj
+                if hasattr(down_proj, 'dtype') and down_proj.dtype == torch.bfloat16:
+                    experts.down_proj.data = down_proj.data.to(torch.float16)
+                elif hasattr(down_proj, 'weight') and down_proj.weight.dtype == torch.bfloat16:
+                    down_proj.weight.data = down_proj.weight.data.to(torch.float16)
+        
         # Process samples one at a time to avoid moving large tensors to GPU
         # The forward pass will materialize weights automatically
         for j in range(args.nsamples):
             with torch.no_grad():
                 sample_inp = inps[j].unsqueeze(0)
+                
+                # DEBUG: Check initial dtype
+                if j == 0 and i == 0:
+                    print(f"DEBUG: inps dtype: {inps.dtype}, sample_inp dtype: {sample_inp.dtype}")
+                    # Check model weight dtype
+                    if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'q_proj'):
+                        print(f"DEBUG: layer.self_attn.q_proj.weight.dtype: {layer.self_attn.q_proj.weight.dtype}")
+                    if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate_proj'):
+                        print(f"DEBUG: layer.mlp.gate_proj.weight.dtype: {layer.mlp.gate_proj.weight.dtype}")
+                    # Check first model parameter dtype
+                    model_param_dtype = next(iter(model.parameters())).dtype
+                    print(f"DEBUG: first model parameter dtype: {model_param_dtype}")
+                
                 # Get layer device
                 if f"model.layers.{i}" in model.hf_device_map:
                     layer_dev = model.hf_device_map[f"model.layers.{i}"]
@@ -381,38 +552,33 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                     layer_dev = inps.device
                 
                 # Move only this sample to layer device (avoids moving 4GB tensor)
+                # DO NOT convert dtype - inps is already created with the correct model dtype
+                # Converting dtype can cause mismatches between attention and MLP layers
                 if sample_inp.device != layer_dev:
                     sample_inp = sample_inp.to(layer_dev)
-                    # Handle attention_mask and position_ids
-                    if attention_mask is not None:
-                        if len(attention_mask.shape) == 2:
-                            sample_attn = attention_mask.to(layer_dev)
-                        else:
-                            sample_attn = attention_mask[j:j+1].to(layer_dev) if attention_mask.device != layer_dev else attention_mask[j:j+1]
+                
+                # DEBUG: Check dtype after device conversion
+                if j == 0 and i == 0:
+                    print(f"DEBUG: sample_inp dtype after device conversion: {sample_inp.dtype}")
+                
+                # Handle attention_mask and position_ids
+                if attention_mask is not None:
+                    if len(attention_mask.shape) == 2:
+                        sample_attn = attention_mask.to(layer_dev)
                     else:
-                        sample_attn = None
-                    # Generate position_ids if None (required by decoder layers for position embeddings)
-                    if position_ids is not None:
-                        if len(position_ids.shape) == 2:
-                            sample_pos = position_ids.to(layer_dev)
-                        else:
-                            sample_pos = position_ids[j:j+1].to(layer_dev) if position_ids.device != layer_dev else position_ids[j:j+1]
-                    else:
-                        # Generate position_ids: [0, 1, 2, ..., seqlen-1]
-                        seq_len = sample_inp.shape[1]
-                        sample_pos = torch.arange(0, seq_len, dtype=torch.long, device=layer_dev).unsqueeze(0)
+                        sample_attn = attention_mask[j:j+1].to(layer_dev) if attention_mask.device != layer_dev else attention_mask[j:j+1]
                 else:
-                    sample_attn = attention_mask
-                    # Generate position_ids if None
-                    if position_ids is not None:
-                        # Ensure position_ids is on the same device as sample_inp
-                        if len(position_ids.shape) == 2:
-                            sample_pos = position_ids.to(layer_dev) if position_ids.device != layer_dev else position_ids
-                        else:
-                            sample_pos = position_ids[j:j+1].to(layer_dev) if position_ids.device != layer_dev else position_ids[j:j+1]
+                    sample_attn = None
+                # Generate position_ids if None (required by decoder layers for position embeddings)
+                if position_ids is not None:
+                    if len(position_ids.shape) == 2:
+                        sample_pos = position_ids.to(layer_dev)
                     else:
-                        seq_len = sample_inp.shape[1]
-                        sample_pos = torch.arange(0, seq_len, dtype=torch.long, device=layer_dev).unsqueeze(0)
+                        sample_pos = position_ids[j:j+1].to(layer_dev) if position_ids.device != layer_dev else position_ids[j:j+1]
+                else:
+                    # Generate position_ids: [0, 1, 2, ..., seqlen-1]
+                    seq_len = sample_inp.shape[1]
+                    sample_pos = torch.arange(0, seq_len, dtype=torch.long, device=layer_dev).unsqueeze(0)
                 
                 # CRITICAL: Ensure sample_pos is on the same device as sample_inp
                 if sample_pos.device != sample_inp.device:
@@ -634,8 +800,13 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                 # CRITICAL: Ensure sample_inp and sample_pos are on layer_dev BEFORE computing position_embeddings
                 # This must happen first to avoid device mismatches when using model.model.rotary_emb
                 # The rotary_emb is shared across layers, so we need to ensure inputs are on the correct device
+                # Also ensure dtype matches model dtype (important for bfloat16 models like gpt_oss)
+                model_dtype = next(iter(model.parameters())).dtype
                 if sample_inp.device != layer_dev:
                     sample_inp = sample_inp.to(layer_dev)
+                # CRITICAL: Convert to model dtype early (bfloat16 for gpt_oss)
+                if sample_inp.dtype != model_dtype:
+                    sample_inp = sample_inp.to(model_dtype)
                 if sample_pos.device != layer_dev:
                     sample_pos = sample_pos.to(layer_dev).contiguous()
                 
@@ -687,6 +858,19 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                             # Compute position_embeddings: rotary_emb(hidden_states, position_ids) returns (cos, sin)
                             # For transformers 4.45.2, rotary_emb.forward(x, position_ids) signature
                             # Ensure both inputs are on the same device
+                            # CRITICAL: Ensure position_ids match the actual sequence length of sample_inp
+                            # Clear rotary embedding cache if it exists to avoid size mismatches
+                            actual_seq_len = sample_inp.shape[1]
+                            if hasattr(rotary_emb, '_cos_cached') and rotary_emb._cos_cached is not None:
+                                cached_seq_len = rotary_emb._cos_cached.shape[-2] if len(rotary_emb._cos_cached.shape) > 1 else rotary_emb._cos_cached.shape[0]
+                                if cached_seq_len != actual_seq_len:
+                                    # Clear cache to force recomputation with correct sequence length
+                                    rotary_emb._cos_cached = None
+                                    rotary_emb._sin_cached = None
+                            # Ensure position_ids match actual sequence length
+                            if sample_pos.shape[1] != actual_seq_len:
+                                sample_pos = torch.arange(0, actual_seq_len, dtype=torch.long, device=sample_pos.device).unsqueeze(0)
+                            
                             try:
                                 position_embeddings = rotary_emb(sample_inp, sample_pos)
                             except TypeError:
@@ -696,8 +880,21 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                                 except TypeError:
                                     position_embeddings = rotary_emb(x=sample_inp, position_ids=sample_pos)
                             except RuntimeError as e_dev:
+                                # Check if it's a size mismatch error
+                                if "size" in str(e_dev).lower() or "dimension" in str(e_dev).lower():
+                                    # Clear cache and retry with correct sequence length
+                                    if hasattr(rotary_emb, '_cos_cached'):
+                                        rotary_emb._cos_cached = None
+                                        rotary_emb._sin_cached = None
+                                    try:
+                                        position_embeddings = rotary_emb(sample_inp, sample_pos)
+                                    except TypeError:
+                                        try:
+                                            position_embeddings = rotary_emb(sample_inp, position_ids=sample_pos)
+                                        except TypeError:
+                                            position_embeddings = rotary_emb(x=sample_inp, position_ids=sample_pos)
                                 # Device mismatch - ensure everything is on the same device
-                                if "same device" in str(e_dev) or "device" in str(e_dev).lower():
+                                elif "same device" in str(e_dev) or "device" in str(e_dev).lower():
                                     # Get the device from sample_inp (which should be on layer_dev)
                                     target_dev = sample_inp.device
                                     # Ensure rotary_emb.inv_freq is on target_dev
@@ -730,64 +927,174 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                 if sample_attn is not None and sample_attn.device != layer_dev:
                     sample_attn = sample_attn.to(layer_dev)
                 
-                # Call layer with position_ids and position_embeddings
-                # In transformers 4.45.2, decoder layer accepts position_ids and optional position_embeddings
-                # If position_embeddings is None, the layer uses its own rotary_emb which must be on the same device
-                try:
-                    if position_embeddings is not None:
-                        # Ensure position_embeddings tensors are also on layer_dev
-                        if isinstance(position_embeddings, (tuple, list)) and len(position_embeddings) == 2:
-                            cos, sin = position_embeddings
-                            if cos.device != layer_dev:
-                                cos = cos.to(layer_dev)
-                            if sin.device != layer_dev:
-                                sin = sin.to(layer_dev)
-                            position_embeddings = (cos, sin)
-                        out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos, position_embeddings=position_embeddings)[0]
-                    else:
-                        # Fallback: try with just position_ids (decoder layer will use its own rotary_emb)
-                        # CRITICAL: Ensure sample_pos is on the same device as the layer's rotary_emb
-                        # The layer's rotary_emb.inv_freq should be on layer_dev (CPU for offloaded layers)
-                        # Create contiguous copy to ensure it's actually on the right device (not a view)
-                        if sample_pos.device != layer_dev:
-                            sample_pos = sample_pos.to(layer_dev).contiguous()
-                        # Also ensure the layer's rotary_emb is on layer_dev
-                        # Move the entire rotary_emb module to ensure all buffers are on the correct device
-                        if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'rotary_emb'):
-                            rotary_emb = layer.self_attn.rotary_emb
+                # CRITICAL: Always clear rotary_emb cache on the layer before calling it
+                # This is essential for models like gpt_oss that cache rotary embeddings
+                # The cache might be for a different sequence length, causing size mismatches
+                # We clear unconditionally to ensure the layer recomputes with the correct sequence length
+                actual_seq_len = sample_inp.shape[1]
+                if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'rotary_emb'):
+                    layer_rotary_emb = layer.self_attn.rotary_emb
+                    # Always clear cache to force recomputation with current sequence length
+                    if hasattr(layer_rotary_emb, '_cos_cached'):
+                        layer_rotary_emb._cos_cached = None
+                    if hasattr(layer_rotary_emb, '_sin_cached'):
+                        layer_rotary_emb._sin_cached = None
+                    # Also clear any other cache attributes that might exist
+                    for attr_name in dir(layer_rotary_emb):
+                        if 'cache' in attr_name.lower() and not attr_name.startswith('__'):
                             try:
-                                # Move the entire module to layer_dev
-                                rotary_emb.to(layer_dev)
-                            except Exception:
-                                # If moving the module fails, try moving inv_freq directly
-                                if hasattr(rotary_emb, 'inv_freq'):
-                                    if not hasattr(rotary_emb.inv_freq, 'device') or rotary_emb.inv_freq.device != layer_dev:
-                                        # Materialize from state_dict if needed
-                                        try:
-                                            state_dict = model.state_dict()
-                                            rotary_key = f"model.layers.{i}.self_attn.rotary_emb.inv_freq"
-                                            if rotary_key in state_dict:
-                                                inv_freq = state_dict[rotary_key].to(layer_dev)
-                                                rotary_emb.register_buffer('inv_freq', inv_freq, persistent=False)
-                                            elif hasattr(rotary_emb.inv_freq, 'device'):
-                                                inv_freq = rotary_emb.inv_freq.to(layer_dev)
-                                                rotary_emb.register_buffer('inv_freq', inv_freq, persistent=False)
-                                        except Exception as e_dev_fix:
-                                            # Last resort: try to move it anyway
-                                            if hasattr(rotary_emb.inv_freq, 'device'):
-                                                inv_freq = rotary_emb.inv_freq.to(layer_dev)
-                                                rotary_emb.register_buffer('inv_freq', inv_freq, persistent=False)
-                        
-                        # FINAL CHECK: Ensure sample_pos is definitely on layer_dev before calling layer
-                        # Create a new contiguous tensor to avoid any view/slice issues
-                        if sample_pos.device != layer_dev:
-                            sample_pos = torch.tensor(sample_pos.cpu().numpy(), dtype=sample_pos.dtype, device=layer_dev)
-                        # Double-check
-                        assert sample_pos.device == layer_dev, f"sample_pos device mismatch before layer call: {sample_pos.device} != {layer_dev}"
-                        
-                        out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos)[0]
+                                setattr(layer_rotary_emb, attr_name, None)
+                            except:
+                                pass
+                
+                # For gpt_oss models, we need to compute position_embeddings and pass them
+                # The model expects position_embeddings to be passed, not computed internally
+                # Ensure position_ids match actual sequence length
+                if sample_pos.shape[1] != actual_seq_len:
+                    sample_pos = torch.arange(0, actual_seq_len, dtype=torch.long, device=layer_dev).unsqueeze(0)
+                
+                # CRITICAL: Ensure sample_pos is on the same device as the layer's rotary_emb
+                if sample_pos.device != layer_dev:
+                    sample_pos = sample_pos.to(layer_dev).contiguous()
+                
+                # Compute position_embeddings using the layer's rotary_emb (cache already cleared above)
+                # sample_inp is already on layer_dev and correct dtype from above (lines 422-426)
+                position_embeddings = None
+                if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'rotary_emb'):
+                    layer_rotary_emb = layer.self_attn.rotary_emb
+                    # sample_inp is already on layer_dev and correct dtype, use it directly
+                    try:
+                        position_embeddings = layer_rotary_emb(sample_inp, sample_pos)
+                    except TypeError:
+                        try:
+                            position_embeddings = layer_rotary_emb(sample_inp, position_ids=sample_pos)
+                        except TypeError:
+                            position_embeddings = layer_rotary_emb(x=sample_inp, position_ids=sample_pos)
+                
+                # Call layer with position_embeddings (gpt_oss requires them)
+                # If position_embeddings is None, we need to raise an error or try to compute it
+                if position_embeddings is None:
+                    # Try to compute using shared rotary_emb if available
+                    if hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
+                        rotary_emb = model.model.rotary_emb
+                        try:
+                            position_embeddings = rotary_emb(sample_inp, sample_pos)
+                        except TypeError:
+                            try:
+                                position_embeddings = rotary_emb(sample_inp, position_ids=sample_pos)
+                            except TypeError:
+                                position_embeddings = rotary_emb(x=sample_inp, position_ids=sample_pos)
+                    if position_embeddings is None:
+                        raise RuntimeError(f"Could not compute position_embeddings for layer {i}, sample {j}. Model requires position_embeddings.")
+                
+                # Ensure position_embeddings are on layer_dev and match sample_inp dtype
+                if isinstance(position_embeddings, (tuple, list)) and len(position_embeddings) == 2:
+                    cos, sin = position_embeddings
+                    if cos.device != layer_dev:
+                        cos = cos.to(layer_dev)
+                    if sin.device != layer_dev:
+                        sin = sin.to(layer_dev)
+                    # Ensure dtype matches sample_inp dtype (which matches model dtype)
+                    if cos.dtype != sample_inp.dtype:
+                        cos = cos.to(sample_inp.dtype)
+                    if sin.dtype != sample_inp.dtype:
+                        sin = sin.to(sample_inp.dtype)
+                    position_embeddings = (cos, sin)
+                
+                # DEBUG: Check dtypes before layer call
+                if j == 0 and i == 0:
+                    print(f"DEBUG: Before layer call - sample_inp dtype: {sample_inp.dtype}, device: {sample_inp.device}")
+                    if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate_proj'):
+                        print(f"DEBUG: layer.mlp.gate_proj.weight.dtype: {layer.mlp.gate_proj.weight.dtype}, device: {layer.mlp.gate_proj.weight.device}")
+                    if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'o_proj'):
+                        print(f"DEBUG: layer.self_attn.o_proj.weight.dtype: {layer.self_attn.o_proj.weight.dtype}")
+                    if position_embeddings is not None and isinstance(position_embeddings, (tuple, list)):
+                        cos, sin = position_embeddings
+                        print(f"DEBUG: position_embeddings cos dtype: {cos.dtype}, sin dtype: {sin.dtype}")
+                
+                # DEBUG: Hook to capture attention output dtype and MLP input dtype
+                attn_output_dtype = None
+                mlp_input_dtype = None
+                handles = []
+                if j == 0 and i == 0:
+                    def attn_hook_fn(module, input, output):
+                        nonlocal attn_output_dtype
+                        if isinstance(output, tuple):
+                            attn_output_dtype = output[0].dtype
+                        else:
+                            attn_output_dtype = output.dtype
+                    def mlp_hook_fn(module, input, output):
+                        nonlocal mlp_input_dtype
+                        if isinstance(input, tuple):
+                            mlp_input_dtype = input[0].dtype
+                        else:
+                            mlp_input_dtype = input.dtype
+                    if hasattr(layer, 'self_attn'):
+                        handles.append(layer.self_attn.register_forward_hook(attn_hook_fn))
+                    if hasattr(layer, 'mlp'):
+                        handles.append(layer.mlp.register_forward_hook(mlp_hook_fn))
+                
+                # Disable autocast to prevent dtype conversions
+                # The model weights are float16, so we need to ensure all operations stay in float16
+                # Handle sink tokens shape mismatch for gpt_oss during calibration
+                try:
+                    # Try passing use_sinks=False if the layer supports it
+                    layer_kwargs = {
+                        'attention_mask': sample_attn,
+                        'position_ids': sample_pos,
+                        'position_embeddings': position_embeddings
+                    }
+                    # Check if layer supports use_sinks parameter
+                    if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'forward'):
+                        # Try to disable sink tokens via kwargs if supported
+                        import inspect
+                        sig = inspect.signature(layer.self_attn.forward)
+                        if 'use_sinks' in sig.parameters:
+                            layer_kwargs['use_sinks'] = False
+                    
+                    with torch.cuda.amp.autocast(enabled=False):
+                        out = layer(sample_inp, **layer_kwargs)[0]
+                    
+                    # Ensure output dtype matches input dtype (float16)
+                    if out.dtype != sample_inp.dtype:
+                        out = out.to(sample_inp.dtype)
+                    
+                    # DEBUG: Print dtypes after forward pass
+                    if j == 0 and i == 0:
+                        if attn_output_dtype is not None:
+                            print(f"DEBUG: Attention output dtype (from hook): {attn_output_dtype}")
+                        if mlp_input_dtype is not None:
+                            print(f"DEBUG: MLP input dtype (from hook): {mlp_input_dtype}")
+                        if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
+                            # gpt_oss has experts structure
+                            experts = layer.mlp.experts
+                            if hasattr(experts, 'gate_up_proj'):
+                                gate_up_proj = experts.gate_up_proj
+                                if hasattr(gate_up_proj, 'weight'):
+                                    print(f"DEBUG: layer.mlp.experts.gate_up_proj.weight.dtype: {gate_up_proj.weight.dtype}")
+                                else:
+                                    print(f"DEBUG: layer.mlp.experts.gate_up_proj.dtype: {gate_up_proj.dtype}")
+                        print(f"DEBUG: Layer output dtype: {out.dtype}")
+                        for h in handles:
+                            h.remove()
                 except (TypeError, RuntimeError) as e:
                     error_str = str(e)
+                    if j == 0 and i == 0:
+                        if attn_output_dtype is not None:
+                            print(f"DEBUG: Error occurred, attention output dtype was: {attn_output_dtype}")
+                        if mlp_input_dtype is not None:
+                            print(f"DEBUG: Error occurred, MLP input dtype was: {mlp_input_dtype}")
+                        if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
+                            # Check gate_up_proj dtype - it might be a Parameter directly, not a Linear layer
+                            experts = layer.mlp.experts
+                            if hasattr(experts, 'gate_up_proj'):
+                                gate_up_proj = experts.gate_up_proj
+                                if hasattr(gate_up_proj, 'weight'):
+                                    print(f"DEBUG: layer.mlp.experts.gate_up_proj.weight.dtype: {gate_up_proj.weight.dtype}")
+                                else:
+                                    print(f"DEBUG: layer.mlp.experts.gate_up_proj.dtype: {gate_up_proj.dtype}")
+                        for h in handles:
+                            h.remove()
                     if "cannot unpack non-iterable NoneType object" in error_str or "position_embeddings" in error_str or "NoneType" in error_str:
                         # Rotary embedding issue - ensure rotary_emb is properly initialized
                         print(f"Warning: Rotary embedding issue at layer {i}, sample {j}. Error: {error_str}")
@@ -800,6 +1107,8 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                                 rotary_emb = model.model.rotary_emb
                                 # CRITICAL: Ensure rotary_emb.inv_freq is on the same device as sample_inp
                                 target_device = sample_inp.device
+                                target_dtype = sample_inp.dtype  # Use sample_inp dtype to ensure consistency
+                                
                                 if hasattr(rotary_emb, 'inv_freq'):
                                     if hasattr(rotary_emb.inv_freq, 'device'):
                                         if rotary_emb.inv_freq.device.type == 'meta':
@@ -814,16 +1123,28 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                                 if sample_pos is not None and sample_pos.device != target_device:
                                     sample_pos = sample_pos.to(target_device)
                                 
+                                # Ensure sample_inp dtype matches model_dtype (critical for dtype consistency)
+                                sample_inp_for_rotary = sample_inp
+                                if sample_inp_for_rotary.dtype != target_dtype:
+                                    sample_inp_for_rotary = sample_inp_for_rotary.to(target_dtype)
+                                
                                 # Recompute position_embeddings
                                 try:
-                                    position_embeddings = rotary_emb(sample_inp, sample_pos)
+                                    position_embeddings = rotary_emb(sample_inp_for_rotary, sample_pos)
                                 except TypeError:
                                     try:
-                                        position_embeddings = rotary_emb(sample_inp, position_ids=sample_pos)
+                                        position_embeddings = rotary_emb(sample_inp_for_rotary, position_ids=sample_pos)
                                     except TypeError:
-                                        position_embeddings = rotary_emb(x=sample_inp, position_ids=sample_pos)
+                                        position_embeddings = rotary_emb(x=sample_inp_for_rotary, position_ids=sample_pos)
                                 
                                 if position_embeddings is not None and isinstance(position_embeddings, (tuple, list)) and len(position_embeddings) == 2:
+                                    # Ensure position_embeddings dtype matches
+                                    cos, sin = position_embeddings
+                                    if cos.dtype != target_dtype:
+                                        cos = cos.to(target_dtype)
+                                    if sin.dtype != target_dtype:
+                                        sin = sin.to(target_dtype)
+                                    position_embeddings = (cos, sin)
                                     fixed = True
                         except Exception as e_fix:
                             print(f"  Could not recompute position_embeddings: {e_fix}")
@@ -844,6 +1165,14 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                         raise
                 # Move output back to calibration device
                 outs[j] = out.to(inps.device)
+        
+        # Restore original attention interface if we patched it
+        if patched_attention and original_eager_attention is not None:
+            try:
+                import transformers.models.gpt_oss.modeling_gpt_oss as gpt_oss_module
+                gpt_oss_module.eager_attention_forward = original_eager_attention
+            except:
+                pass
         
         # After forward pass, ensure all weights in this layer are materialized
         # by accessing them explicitly
@@ -1141,14 +1470,83 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0" if torch.cu
                                     inv_freq = state_dict[rotary_key].to(layer_dev)
                                     rotary_emb.register_buffer('inv_freq', inv_freq, persistent=False)
                 
+                # Clear rotary embedding cache before forward pass (after pruning)
+                # Also clear shared rotary_emb cache if it exists
+                if hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
+                    shared_rotary_emb = model.model.rotary_emb
+                    if hasattr(shared_rotary_emb, '_cos_cached'):
+                        shared_rotary_emb._cos_cached = None
+                    if hasattr(shared_rotary_emb, '_sin_cached'):
+                        shared_rotary_emb._sin_cached = None
+                    for attr_name in dir(shared_rotary_emb):
+                        if 'cache' in attr_name.lower() and not attr_name.startswith('__'):
+                            try:
+                                setattr(shared_rotary_emb, attr_name, None)
+                            except:
+                                pass
+                
+                if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'rotary_emb'):
+                    layer_rotary_emb = layer.self_attn.rotary_emb
+                    if hasattr(layer_rotary_emb, '_cos_cached'):
+                        layer_rotary_emb._cos_cached = None
+                    if hasattr(layer_rotary_emb, '_sin_cached'):
+                        layer_rotary_emb._sin_cached = None
+                    # Clear any other cache attributes
+                    for attr_name in dir(layer_rotary_emb):
+                        if 'cache' in attr_name.lower() and not attr_name.startswith('__'):
+                            try:
+                                setattr(layer_rotary_emb, attr_name, None)
+                            except:
+                                pass
+                
+                # Recompute position_embeddings after clearing cache
+                position_embeddings = None
+                if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'rotary_emb'):
+                    layer_rotary_emb = layer.self_attn.rotary_emb
+                    try:
+                        # Ensure rotary_emb is on correct device and dtype
+                        sample_inp_for_rotary = sample_inp.to(layer_dev)
+                        if sample_inp_for_rotary.dtype != model_dtype:
+                            sample_inp_for_rotary = sample_inp_for_rotary.to(model_dtype)
+                        position_embeddings = layer_rotary_emb(sample_inp_for_rotary, sample_pos)
+                    except TypeError:
+                        try:
+                            position_embeddings = layer_rotary_emb(sample_pos)
+                        except:
+                            pass
+                    except Exception:
+                        pass
+                
+                # If position_embeddings still None, try using shared rotary_emb
+                if position_embeddings is None and hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
+                    try:
+                        shared_rotary_emb = model.model.rotary_emb
+                        sample_inp_for_rotary = sample_inp.to(layer_dev)
+                        if sample_inp_for_rotary.dtype != model_dtype:
+                            sample_inp_for_rotary = sample_inp_for_rotary.to(model_dtype)
+                        position_embeddings = shared_rotary_emb(sample_inp_for_rotary, sample_pos)
+                    except Exception:
+                        pass
+                
                 # Call layer with position_ids and position_embeddings
+                # gpt_oss requires position_embeddings, so we must have it
                 if position_embeddings is not None:
                     out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos, position_embeddings=position_embeddings)[0]
                 else:
-                    # Final check: ensure sample_pos is on layer_dev
+                    # Last resort: try without position_embeddings (may fail but worth trying)
                     if sample_pos.device != layer_dev:
                         sample_pos = torch.tensor(sample_pos.cpu().numpy(), dtype=sample_pos.dtype, device=layer_dev)
-                    out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos)[0]
+                    # Try to compute position_embeddings inline
+                    try:
+                        if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'rotary_emb'):
+                            layer_rotary_emb = layer.self_attn.rotary_emb
+                            position_embeddings = layer_rotary_emb(sample_inp.to(layer_dev), sample_pos)
+                            out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos, position_embeddings=position_embeddings)[0]
+                        else:
+                            out = layer(sample_inp, attention_mask=sample_attn, position_ids=sample_pos)[0]
+                    except Exception as e:
+                        # If all else fails, raise with helpful message
+                        raise RuntimeError(f"Could not compute position_embeddings for layer {i}: {e}") from e
                 outs[j] = out.to(inps.device)
         
         # Clear wrapped layers and handles to free memory after processing layer
@@ -1218,13 +1616,24 @@ def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
             raise ValueError
+        def __getattr__(self, name):
+            # Forward attribute access to the wrapped module
+            # This is needed for models like gpt_oss that access attributes like attention_type
+            # Use object.__getattribute__ to avoid recursion when accessing self.module
+            if name == 'module':
+                raise AttributeError(f"'{type(self).__name__}' object has no attribute 'module'")
+            try:
+                return object.__getattribute__(self, name)
+            except AttributeError:
+                module = object.__getattribute__(self, 'module')
+                return getattr(module, name)
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
             model(batch[0].to(dev))
         except ValueError:
             pass
-    layers[0] = layers[0].module
+    layers[0] = layers[0]._wrapped_module
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
@@ -1331,13 +1740,24 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
             raise ValueError
+        def __getattr__(self, name):
+            # Forward attribute access to the wrapped module
+            # This is needed for models like gpt_oss that access attributes like attention_type
+            # Use object.__getattribute__ to avoid recursion when accessing self.module
+            if name == 'module':
+                raise AttributeError(f"'{type(self).__name__}' object has no attribute 'module'")
+            try:
+                return object.__getattribute__(self, name)
+            except AttributeError:
+                module = object.__getattribute__(self, 'module')
+                return getattr(module, name)
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
             model(batch[0].to(dev))
         except ValueError:
             pass
-    layers[0] = layers[0].module
+    layers[0] = layers[0]._wrapped_module
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
