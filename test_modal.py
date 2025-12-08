@@ -211,8 +211,109 @@ def test_gpu_pruning(vol: modal.Volume):
     
     return returncode
 
+@app.function(
+    image=image,
+    gpu="H100",  # Use H100 with 80GB (more memory for large models)
+    volumes={"/cache": volume},
+    timeout=3600,  # 1 hour timeout
+    secrets=[modal.Secret.from_name("hf-secret")],  # For HuggingFace token
+)
+def eval_pruned_model_ppl(model_path: str = None, use_cpu: bool = False, skip_sparsity_check: bool = False):
+    """Evaluate perplexity on an already pruned model without re-pruning."""
+    import subprocess
+    import sys
+    import os
+    
+    # Set Modal environment variable
+    os.environ["MODAL_ENVIRONMENT"] = "1"
+    
+    # Set working directory to mounted code
+    os.chdir("/workspace")
+    
+    # Default model path if not provided
+    if model_path is None:
+        model_path = "/cache/pruned_models/gptt-oss-20b-_test"
+    
+    # Verify model exists
+    if not os.path.exists(model_path):
+        print(f"ERROR: Model not found at {model_path}")
+        print("Available models in /cache/pruned_models/:")
+        pruned_models_dir = "/cache/pruned_models"
+        if os.path.exists(pruned_models_dir):
+            for item in os.listdir(pruned_models_dir):
+                item_path = os.path.join(pruned_models_dir, item)
+                item_type = 'dir' if os.path.isdir(item_path) else 'file'
+                print(f"  {item} ({item_type})")
+        sys.exit(1)
+    
+    # Build command
+    cmd = [
+        "python", "eval_pruned_model.py",
+        "--model_path", model_path,
+    ]
+    
+    if use_cpu:
+        cmd.append("--use_cpu")
+    
+    if skip_sparsity_check:
+        cmd.append("--skip_sparsity_check")
+    
+    print("=" * 60)
+    print("Evaluating Perplexity on Pruned Model")
+    print("=" * 60)
+    print(f"Model path: {model_path}")
+    print(f"Command: {' '.join(cmd)}")
+    print("=" * 60)
+    
+    # Run the command with real-time output streaming
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True
+    )
+    
+    # Stream output in real-time
+    stdout_lines = []
+    for line in process.stdout:
+        print(line, end='', flush=True)
+        stdout_lines.append(line)
+    
+    # Wait for process to complete
+    returncode = process.wait()
+    stdout = ''.join(stdout_lines)
+    
+    if returncode == 0:
+        print("\n" + "=" * 60)
+        print("✅ Perplexity evaluation completed successfully!")
+        print("=" * 60)
+    else:
+        print("\n" + "=" * 60)
+        print("❌ Perplexity evaluation failed")
+        print("=" * 60)
+        if stdout:
+            print("\nSTDOUT:")
+            print(stdout)
+        print(f"\nExit code: {returncode}")
+        sys.exit(1)
+    
+    return returncode
+
 @app.local_entrypoint()
-def main():
-    """Entry point for local execution."""
-    test_gpu_pruning.remote(volume)
+def main(skip_pruning: bool = False, model_path: str = None, use_cpu: bool = False, skip_sparsity_check: bool = False):
+    """
+    Entry point for local execution.
+    
+    Args:
+        skip_pruning: If True, skip pruning and only run perplexity evaluation
+        model_path: Path to pruned model (required if skip_pruning=True)
+        use_cpu: Force CPU usage for evaluation
+        skip_sparsity_check: Skip sparsity check during evaluation
+    """
+    if skip_pruning:
+        eval_pruned_model_ppl.remote(model_path, use_cpu, skip_sparsity_check)
+    else:
+        test_gpu_pruning.remote(volume)
 

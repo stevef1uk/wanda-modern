@@ -96,17 +96,44 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
         if model.config.hidden_size >= 5120:  # 20B+ models typically have hidden_size >= 5120
             bs = 1
             print(f"Using batch size {bs} for evaluation (large model detected)")
-    # Get input IDs
-    testenc = testenc.input_ids
-
-    # Use actual sequence length from testenc, not model.seqlen (which might be 131k)
-    # The testenc was created with eval_seqlen (capped at 2048), so use that
-    actual_seqlen = testenc.shape[1] if len(testenc.shape) > 1 else model.seqlen
-    # Cap at reasonable limit
-    actual_seqlen = min(actual_seqlen, 2048)
     
-    # Calculate number of samples
-    nsamples = testenc.numel() // actual_seqlen
+    # Handle both DataLoader/list and tokenized dataset
+    # Check if testenc is a DataLoader/list or a tokenized dataset
+    # Tokenized datasets have .input_ids attribute (TokenizerWrapper or BatchEncoding)
+    # Priority: check for input_ids first (most reliable indicator)
+    is_dataloader = not hasattr(testenc, 'input_ids')
+    
+    if is_dataloader:
+        # testenc is a DataLoader - get number of samples from length
+        nsamples = len(testenc)
+        # Get actual_seqlen from first sample
+        if nsamples > 0:
+            first_sample = testenc[0][0] if isinstance(testenc[0], (list, tuple)) else testenc[0]
+            actual_seqlen = first_sample.shape[0] if isinstance(first_sample, torch.Tensor) else model.seqlen
+        else:
+            actual_seqlen = model.seqlen
+        actual_seqlen = min(actual_seqlen, 2048)
+    else:
+        # testenc is a tokenized dataset - get input_ids
+        if hasattr(testenc, 'input_ids'):
+            testenc = testenc.input_ids
+        # Handle batch dimension - testenc might be [1, total_tokens] or [total_tokens]
+        if len(testenc.shape) == 2 and testenc.shape[0] == 1:
+            # Squeeze batch dimension: [1, total_tokens] -> [total_tokens]
+            testenc = testenc.squeeze(0)
+        # Use actual sequence length from testenc, not model.seqlen (which might be 131k)
+        # The testenc was created with eval_seqlen (capped at 2048), so use that
+        actual_seqlen = testenc.shape[0] if len(testenc.shape) == 1 else (testenc.shape[1] if len(testenc.shape) > 1 else model.seqlen)
+        # Cap at reasonable limit
+        actual_seqlen = min(actual_seqlen, 2048)
+        
+        # Calculate number of samples from total tokens
+        # For 1D tensor: nsamples = len(testenc) // actual_seqlen
+        # For 2D tensor: nsamples = testenc.numel() // actual_seqlen
+        if len(testenc.shape) == 1:
+            nsamples = len(testenc) // actual_seqlen
+        else:
+            nsamples = testenc.numel() // actual_seqlen
 
     # Determine input device - if model has offloaded layers, use CPU for inputs
     # to avoid OOM when materializing offloaded layers
@@ -159,8 +186,28 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
         j = min(i+bs, nsamples)
 
         # Prepare inputs and move to device
-        inputs = testenc[:,(i * actual_seqlen):(j * actual_seqlen)].to(input_device)
-        inputs = inputs.reshape(j-i, actual_seqlen)
+        if is_dataloader:
+            # Get inputs from DataLoader
+            inputs = testenc[i][0].to(input_device)
+            if isinstance(inputs, torch.Tensor) and len(inputs.shape) == 1:
+                inputs = inputs.unsqueeze(0)  # Add batch dimension if needed
+            # Ensure correct shape
+            if inputs.shape[0] != (j-i):
+                # If we need multiple samples, get them
+                batch_inputs = []
+                for idx in range(i, j):
+                    sample = testenc[idx][0].to(input_device)
+                    if len(sample.shape) == 1:
+                        sample = sample.unsqueeze(0)
+                    batch_inputs.append(sample)
+                inputs = torch.cat(batch_inputs, dim=0)
+        else:
+            # Get inputs from tokenized dataset
+            # testenc is now 1D [total_tokens] after squeezing batch dimension
+            start_idx = i * actual_seqlen
+            end_idx = j * actual_seqlen
+            inputs = testenc[start_idx:end_idx].to(input_device)
+            inputs = inputs.reshape(j-i, actual_seqlen)
 
         # Forward pass through the model
         try:
@@ -210,9 +257,26 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
         # Compute loss
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
+        
+        # Check for invalid loss values
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"WARNING: Invalid loss at sample {i}: {loss.item()}")
+            print(f"  Input shape: {inputs.shape}")
+            print(f"  Logits shape: {lm_logits.shape}")
+            print(f"  Shift logits shape: {shift_logits.shape}")
+            print(f"  Shift labels shape: {shift_labels.shape}")
+            # Skip this sample or use a default value
+            loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
         # Calculate negative log likelihood
-        neg_log_likelihood = loss.float() * actual_seqlen * (j-i)
+        # For DataLoader: each sample is already a full sequence, so multiply by (j-i) samples
+        # For tokenized dataset: we're processing chunks, so multiply by actual_seqlen * (j-i)
+        if is_dataloader:
+            # Each sample in DataLoader is a full sequence
+            neg_log_likelihood = loss.float() * actual_seqlen * (j-i)
+        else:
+            # Tokenized dataset: loss is already per-token, multiply by number of tokens processed
+            neg_log_likelihood = loss.float() * actual_seqlen * (j-i)
 
         # Append to list of negative log likelihoods
         nlls.append(neg_log_likelihood)
@@ -222,7 +286,24 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
             torch.cuda.empty_cache()
 
     # Compute perplexity
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * actual_seqlen))
+    # Sum all NLLs and divide by total number of tokens evaluated
+    if len(nlls) == 0:
+        raise ValueError("No samples processed - cannot compute perplexity")
+    
+    total_nll = torch.stack(nlls).sum()
+    total_tokens = nsamples * actual_seqlen
+    
+    # Check for invalid values
+    if torch.isnan(total_nll) or torch.isinf(total_nll):
+        print(f"WARNING: Total NLL is invalid: {total_nll}")
+        print(f"  Number of samples: {nsamples}")
+        print(f"  Sequence length: {actual_seqlen}")
+        print(f"  Number of NLL values: {len(nlls)}")
+        if len(nlls) > 0:
+            print(f"  First few NLL values: {[nll.item() for nll in nlls[:5]]}")
+        raise ValueError(f"Cannot compute perplexity: invalid NLL values (NaN or Inf)")
+    
+    ppl = torch.exp(total_nll / total_tokens)
 
     # Clear CUDA cache if using GPU
     if torch.cuda.is_available():

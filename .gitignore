@@ -1,4 +1,46 @@
+# Python
 /*__pycache__/
-.env
 *.pyc
-*.DS_Store
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+modal-env/
+venv/
+env/
+.venv/
+
+# Model weights and generated files (too large for git)
+llm_weights/
+pruned_models/
+workspace/
+*.pt
+*.safetensors
+*.bin
+*.ckpt
+
+# Outputs and logs
+out/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+
+# Temporary files
+*.new
+*.bak
+*.tmp
+CHANGES_SUMMARY.md
